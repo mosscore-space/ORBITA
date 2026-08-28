@@ -151,31 +151,61 @@ a{color:var(--link);}
 .start-item:hover{background:var(--selected-bg);color:#fff;}
 .start-sep{height:1px;background:var(--shadow);border-bottom:1px solid var(--highlight);margin:4px 2px;}
 
-/* ---------- login screen ---------- */
-#login-screen{
-  position:fixed;inset:0;background:var(--desktop);z-index:90;
+/* ---------- Neptune-style login dialog (index.html) ---------- */
+body.login-page{ overflow:hidden; }
+.winlogin-screen{
+  position:fixed;inset:0;z-index:10;
   display:flex;align-items:center;justify-content:center;
+  background:var(--desktop);
+}
+.winlogin-dialog{
+  width:360px;background:var(--face);border:2px outset var(--face);
+  box-shadow:3px 3px 14px rgba(0,0,0,.5);
+}
+.winlogin-titlebar{
+  background:var(--titlebar);color:var(--titletext);
+  display:flex;align-items:center;gap:6px;padding:3px 4px 3px 8px;
+  font-weight:700;font-size:12.5px;
+}
+.winlogin-title{flex:1;}
+.winlogin-titlebtns{display:flex;gap:2px;}
+.winlogin-titlebtns .tb-noop{
+  width:17px;height:16px;background:var(--face);border:1px outset var(--face);
+  font-size:10px;line-height:1;display:flex;align-items:center;justify-content:center;
+  cursor:default;padding:0;color:#000;
+}
+.winlogin-titlebtns .tb-noop:active{border-style:inset;}
+
+.winlogin-banner{
+  display:flex;align-items:center;gap:12px;padding:14px 16px;
   background:
-    repeating-conic-gradient(from 45deg, rgba(0,0,0,0.03) 0deg 90deg, transparent 90deg 180deg) 0 0/6px 6px,
-    var(--desktop);
+    repeating-linear-gradient(135deg, #e4ecf7 0 10px, #f4f0fb 10px 20px);
+  border-bottom:2px groove var(--face);
 }
-.login-box{
-  width:360px;background:var(--face);border:2px outset var(--face);box-shadow:3px 3px 14px rgba(0,0,0,.5);
+.winlogin-flag{
+  width:46px;height:46px;flex:none;background:#f3c344;border:2px solid #8a6d1a;
+  transform:rotate(45deg);display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;
+  gap:2px;padding:7px;
 }
-.login-box .win98-titlebar{cursor:default;}
-.login-body{padding:22px 24px;display:flex;gap:18px;align-items:flex-start;}
-.login-avatar{
-  width:56px;height:56px;flex:none;background:var(--input-bg);border:2px inset var(--face);
-  display:flex;align-items:center;justify-content:center;font-size:30px;
-}
-.login-fields{flex:1;}
-.login-fields h2{margin:0 0 4px;font-size:15px;}
-.login-fields .hint{font-size:11px;color:var(--text-faint);margin-bottom:12px;}
-.login-fields .field{margin-bottom:12px;}
-.login-fields label{display:block;font-size:12px;margin-bottom:4px;}
-.login-fields input{width:100%;}
-.login-error{color:var(--red);font-size:11.5px;margin-top:-4px;margin-bottom:10px;min-height:14px;}
-.login-actions{display:flex;justify-content:flex-end;gap:8px;padding:10px 24px 20px;}
+.winlogin-flag span{display:block;}
+.winlogin-flag span:nth-child(1){background:#e2231a;}
+.winlogin-flag span:nth-child(2){background:#4caf2e;}
+.winlogin-flag span:nth-child(3){background:#0078d4;}
+.winlogin-flag span:nth-child(4){background:#ffb900;}
+.winlogin-bannertext{line-height:1.05;}
+.winlogin-bannertext .ms-line{font-size:11px;color:#1a1a1a;}
+.winlogin-bannertext .win-line{font-size:22px;font-weight:800;color:#0a0a0a;letter-spacing:-.5px;}
+.winlogin-bannertext .win-line .ninetynine{font-size:30px;font-weight:900;margin-left:2px;}
+.winlogin-bannertext .build-line{font-size:12px;font-weight:700;color:#1a1a1a;margin-top:-2px;}
+
+.winlogin-fields{padding:16px 18px 4px;}
+.wl-row{display:grid;grid-template-columns:78px 1fr;align-items:center;gap:8px;margin-bottom:10px;}
+.wl-row label{font-size:12px;text-align:left;}
+.wl-check{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--text-faint);margin:4px 0 8px;}
+.wl-check input{width:13px;height:13px;}
+.login-error{color:var(--red);font-size:11px;min-height:14px;margin-bottom:4px;}
+.winlogin-actions{display:flex;justify-content:flex-end;gap:6px;padding:8px 16px 16px;flex-wrap:wrap;}
+.winlogin-actions .btn{padding:4px 12px;font-size:11px;min-width:64px;}
 
 /* ---------- shutdown screen ---------- */
 #shutdown-screen{

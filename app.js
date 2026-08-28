@@ -1,102 +1,15 @@
 /* =========================================================
-   Part 0: Login gate
+   Part 0: Boot
    ---------------------------------------------------------
-   The password is never stored as plain text here — only its
-   SHA-256 hash. On submit we hash whatever was typed and
-   compare hashes. This keeps the password out of the page's
-   source, but it is NOT real security: this is a static page,
-   so anyone with the URL can read this file and see exactly
-   how the check works. Treat it as a "keep out" sign for
-   casual visitors, not a lock — the real privacy boundary is
-   which repo/URL you actually share.
+   Login now happens on index.html. By the time app.html loads
+   this file, auth.js has already checked isAuthed() and
+   redirected back to index.html if not — see app.html.
    ========================================================= */
-const ORBITA_AUTH = {
-  user: 'Shaiman',
-  // SHA-256 of the account password — the password itself is not in this file.
-  hash: '1995f6ddc8b63c7cbdb4fd8931ea2dab54daecac20a696afb113852fb11c739c',
-};
-const SESSION_KEY = 'orbita-authed';
-
-async function sha256Hex(message){
-  if(!(window.crypto && window.crypto.subtle)){
-    throw new Error('This browser cannot check the password securely (needs HTTPS or localhost).');
-  }
-  const bytes = new TextEncoder().encode(message);
-  const digest = await crypto.subtle.digest('SHA-256', bytes);
-  return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2,'0')).join('');
-}
-
-function showDesktop(){
-  document.getElementById('login-screen').classList.add('hidden');
-  document.getElementById('shutdown-screen').classList.add('hidden');
-  document.getElementById('desktop').classList.remove('hidden');
-}
-function showLogin(){
-  document.getElementById('desktop').classList.add('hidden');
-  document.getElementById('shutdown-screen').classList.add('hidden');
-  document.getElementById('login-screen').classList.remove('hidden');
-  const pw = document.getElementById('login-password');
-  pw.value = '';
-  setTimeout(()=>pw.focus(), 30);
-}
-
-var bootedOnce = false;
 async function boot(){
-  if(bootedOnce) return;
-  bootedOnce = true;
   document.getElementById('main').innerHTML = '<div class="empty"><div class="t">Loading Orbita…</div></div>';
   await loadState();
   render();
   startClock();
-}
-function logOff(){
-  sessionStorage.removeItem(SESSION_KEY);
-  bootedOnce = false;
-  showLogin();
-}
-
-function wireLogin(){
-  const form = document.getElementById('login-form');
-  const err = document.getElementById('login-error');
-  const pwInput = document.getElementById('login-password');
-
-  form.addEventListener('submit', async (e)=>{
-    e.preventDefault();
-    err.textContent = '';
-    let hash;
-    try{ hash = await sha256Hex(pwInput.value); }
-    catch(ex){ err.textContent = ex.message; return; }
-    if(hash === ORBITA_AUTH.hash){
-      sessionStorage.setItem(SESSION_KEY, '1');
-      showDesktop();
-      boot();
-    } else {
-      err.textContent = 'That password is incorrect. Try again.';
-      pwInput.value = '';
-      pwInput.focus();
-    }
-  });
-
-  document.getElementById('login-cancel-btn').addEventListener('click', ()=>{
-    err.textContent = 'You must log on to use Orbita.';
-    pwInput.value = '';
-  });
-}
-
-/* NOTE: initAuth() is deliberately NOT called here. It runs at the very end
-   of app.js (after js11), once every module's top-level `var` initializers
-   (state, route, ACTIONS, etc.) have executed. Calling boot() this early
-   would run before `var state = defaultState()` in the data module, and a
-   plain var assignment would then silently overwrite whatever boot() just
-   loaded. */
-function initAuth(){
-  wireLogin();
-  if(sessionStorage.getItem(SESSION_KEY) === '1'){
-    showDesktop();
-    boot();
-  } else {
-    showLogin();
-  }
 }
 /* =========================================================
    ORBITA — personal finance
@@ -2015,6 +1928,10 @@ ACTIONS.logOff = ()=>{
   document.getElementById('start-menu').classList.add('hidden');
   confirmDialog('Log off Shaiman?', 'You can log back in any time — nothing is lost.', logOff, 'Log Off');
 };
+function logOff(){
+  clearAuthed(); // from auth.js
+  location.href = 'index.html';
+}
 ACTIONS.shutDown = ()=>{
   document.getElementById('start-menu').classList.add('hidden');
   confirmDialog('Shut down Orbita?', 'This just closes the app view — your data stays saved on this device.', ()=>{
@@ -2036,4 +1953,4 @@ ACTIONS.openRecycleBin = ()=>{
    Final boot trigger — runs after every module above has
    executed its top-level var/const initializers.
    ========================================================= */
-initAuth();
+boot();
