@@ -476,8 +476,20 @@ td.amt.debit{color:var(--red);}
   padding:7px 9px;box-shadow:var(--sunken-thin);background:var(--input-bg);
 }
 .tag-group-block{box-shadow:var(--sunken-thin);padding:10px;margin-bottom:10px;background:var(--face-light);}
+.tag-sub-block{box-shadow:var(--sunken-thin);padding:8px;margin-bottom:8px;background:var(--input-bg);}
 .tag-entry-row{display:flex;align-items:center;gap:6px;padding:5px 0;border-top:1px solid #c8c8c8;}
 .tag-entry-row:first-of-type{border-top:none;}
+
+/* ---------- tag picker tree (transaction tagging modal) ---------- */
+.tag-tree{box-shadow:var(--sunken);background:var(--input-bg);max-height:340px;overflow-y:auto;}
+.tag-tree-row{display:flex;align-items:center;gap:8px;padding:7px 10px;cursor:pointer;font-size:12.5px;border-bottom:1px solid #e6e6e6;}
+.tag-tree-row:hover{background:#e8ecff;}
+.tag-tree-row.lvl1{font-weight:700;background:var(--face);}
+.tag-tree-row.lvl2{padding-left:26px;background:var(--face-light);}
+.tag-tree-row.lvl3{padding-left:44px;cursor:pointer;}
+.tag-tree-row.faint{cursor:default;color:var(--text-faint);}
+.tag-tree-row.faint:hover{background:inherit;}
+.tag-tree-arrow{width:12px;display:inline-block;font-size:10px;color:var(--text-dim);}
 
 .banner{
   display:flex;align-items:center;gap:10px;padding:8px 12px;

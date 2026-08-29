@@ -27,13 +27,13 @@ function defaultState(){
       exchangeRates: { USD: 15.42, EUR: null },
       monthlyBudget: 0,
       incomeCodes: ['salary','bonus'],
-      salaryCutoffDay: 28, // salary posted on/after this day of the month counts toward NEXT month
+      financialMonthStartDay: 28, // a transaction dated on/after this day counts toward NEXT month (pay-period-based "month")
       usdConversion: { mvrAmount: 3084, usdAmount: 200 }, // default amounts for the monthly MVR→USD conversion
     },
     tagGroups: [
-      { id: uid('tg'), name:'Shop', savings:false, entries:[] },
-      { id: uid('tg'), name:'Subscription', savings:false, entries:[] },
-      { id: uid('tg'), name:'Internal Transfer', savings:false, excludeFromSpending:true, entries:[] },
+      { id: uid('tg'), name:'Shop', savings:false, subcategories:[] },
+      { id: uid('tg'), name:'Subscription', savings:false, subcategories:[] },
+      { id: uid('tg'), name:'Internal Transfer', savings:false, excludeFromSpending:true, subcategories:[] },
     ],
     accounts: [],
     liabilities: [],
@@ -52,7 +52,22 @@ var githubSyncInFlight = false;
 function mergeIntoState(parsed){
   state = Object.assign(defaultState(), parsed);
   state.settings = Object.assign(defaultState().settings, parsed.settings||{});
+  // migrate the old single-day-cutoff setting name to the new, more general one
+  if(state.settings.salaryCutoffDay && !(parsed.settings && parsed.settings.financialMonthStartDay)){
+    state.settings.financialMonthStartDay = state.settings.salaryCutoffDay;
+  }
+  delete state.settings.salaryCutoffDay;
   if(!state.tagGroups || !state.tagGroups.length) state.tagGroups = defaultState().tagGroups;
+  // migrate old 2-level tag groups (flat entries) into the new 3-level shape
+  // (group -> subcategory -> entry), wrapping each old entry in its own
+  // subcategory of the same name so existing tagEntryId references on
+  // transactions keep resolving correctly (entry ids are preserved).
+  state.tagGroups.forEach(g => {
+    if(!g.subcategories){
+      g.subcategories = (g.entries || []).map(e => ({ id: uid('tsc'), name: e.name, entries: [e] }));
+      delete g.entries;
+    }
+  });
 }
 function loadLocal(){
   try{
@@ -185,12 +200,14 @@ function fmtDate(iso){
 }
 function monthKey(iso){ return (iso||'').slice(0,7); }
 function attributedMonthKey(iso){
-  // Salary posted on/after settings.salaryCutoffDay belongs to next month
-  // (e.g. paid on the 28th of Aug = September's salary).
+  // This is Orbita's whole "financial month" concept: any transaction dated
+  // on/after settings.financialMonthStartDay belongs to NEXT month, not the
+  // calendar month it actually landed in (e.g. a pay-period that starts the
+  // 28th — spending AND income alike shift forward together).
   const mk = monthKey(iso);
   if(!mk) return mk;
   const day = Number((iso||'').slice(8,10));
-  const cutoff = state.settings.salaryCutoffDay || 28;
+  const cutoff = state.settings.financialMonthStartDay || 28;
   if(!day || day < cutoff) return mk;
   const [y,m] = mk.split('-').map(Number);
   const d = new Date(y, m, 1); // JS month index m = the (m+1)th month, i.e. next month
@@ -263,9 +280,11 @@ function unassignedBalance(acc){
 function tagLookup(tagGroupId, tagEntryId){
   const g = state.tagGroups.find(g=>g.id===tagGroupId);
   if(!g) return null;
-  const e = g.entries.find(e=>e.id===tagEntryId);
-  if(!e) return null;
-  return { group:g, entry:e };
+  for(const sub of (g.subcategories||[])){
+    const e = (sub.entries||[]).find(e=>e.id===tagEntryId);
+    if(e) return { group:g, subcategory:sub, entry:e };
+  }
+  return null;
 }
 function txDisplayDescription(tx){
   return tx.descriptionOverride || tx.description || tx.altDescription || tx.code || '(no description)';
@@ -274,9 +293,11 @@ function autoTagForDescription(desc){
   if(!desc) return null;
   const up = desc.toUpperCase();
   for(const g of state.tagGroups){
-    for(const e of g.entries){
-      for(const kw of (e.matches||[])){
-        if(kw && up.includes(kw.toUpperCase())) return { tagGroupId:g.id, tagEntryId:e.id };
+    for(const sub of (g.subcategories||[])){
+      for(const e of (sub.entries||[])){
+        for(const kw of (e.matches||[])){
+          if(kw && up.includes(kw.toUpperCase())) return { tagGroupId:g.id, tagEntryId:e.id };
+        }
       }
     }
   }
@@ -366,7 +387,7 @@ function render(){
 function openModal(html, opts){
   const root = document.getElementById('modal-root');
   const wide = opts && opts.wide ? ' wide' : '';
-  root.innerHTML = `<div class="modal-overlay" data-action="closeModalBg"><div class="modal${wide}" onclick="event.stopPropagation()">${html}</div></div>`;
+  root.innerHTML = `<div class="modal-overlay" data-action="closeModalBg"><div class="modal${wide}">${html}</div></div>`;
   const firstInput = root.querySelector('input,select,textarea');
   if(firstInput) setTimeout(()=>firstInput.focus(), 30);
 }
@@ -442,19 +463,20 @@ function renderDashboard(){
 
   for(const acc of state.accounts){
     for(const tx of liveTx(acc)){
-      const tmk = monthKey(tx.date);
+      // Orbita's "month" is pay-period based (see attributedMonthKey), so
+      // income and spending both bucket the same way — a transaction dated
+      // on/after the financial-month start day belongs to next month.
+      const tmk = attributedMonthKey(tx.date);
       const excluded = isExcludedFromSpending(tx);
-      if(tx.credit && tx.isIncome && attributedMonthKey(tx.date) === mk){
-        salary += convertToMVR(tx.credit, acc.currency) || 0;
-      }
       if(tmk===mk){
+        if(tx.credit && tx.isIncome) salary += convertToMVR(tx.credit, acc.currency) || 0;
         if(tx.debit && !excluded){
           const mvr = convertToMVR(tx.debit, acc.currency) || 0;
           spent += mvr;
           const place = txDisplayDescription(tx);
           placeMap[place] = (placeMap[place]||0) + mvr;
           const lk = tagLookup(tx.tagGroupId, tx.tagEntryId);
-          const purpose = lk ? lk.group.name : 'Untagged';
+          const purpose = lk ? lk.subcategory.name : 'Untagged';
           purposeMap[purpose] = (purposeMap[purpose]||0) + mvr;
         }
       }
@@ -467,6 +489,8 @@ function renderDashboard(){
   const budget = state.settings.monthlyBudget || 0;
   const left = budget - spent;
   const pct = budget>0 ? Math.min(100, (spent/budget)*100) : 0;
+  const salaryLeft = salary - spent;
+  const salaryLeftPct = salary>0 ? Math.max(0, Math.min(100, (salaryLeft/salary)*100)) : 0;
 
   const netWorth = netWorthMVR();
   const eurAccounts = state.accounts.filter(a=>!a.closed && a.currency==='EUR');
@@ -513,11 +537,11 @@ function renderDashboard(){
       </div>
     </div>
 
-    <div class="grid grid-3" style="align-items:stretch;">
+    <div class="grid grid-2" style="align-items:stretch;margin-bottom:16px;">
       <div class="card">
         <div class="section-title sm">Budget used</div>
         <div class="donut9">
-          <div class="orbit-wrap">${orbitRingSvg(pct)}
+          <div class="orbit-wrap">${orbitRingSvg(pct, '#000080')}
             <div class="orbit-center">
               <div class="pct">${budget>0?Math.round(pct)+'%':'—'}</div>
               <div class="lbl">${monthLabel(mk)}</div>
@@ -531,6 +555,24 @@ function renderDashboard(){
         </div>
       </div>
 
+      <div class="card">
+        <div class="section-title sm">Left from salary</div>
+        <div class="donut9">
+          <div class="orbit-wrap">${orbitRingSvg(salaryLeftPct, '#008000')}
+            <div class="orbit-center">
+              <div class="pct">${salary>0?Math.round(salaryLeftPct)+'%':'—'}</div>
+              <div class="lbl">${monthLabel(mk)}</div>
+            </div>
+          </div>
+          <div class="dn-legend">
+            <div><span class="sw" style="background:#008000"></span> Left <b style="${salaryLeft<0?'color:var(--red)':''}">${salary>0?fmtMoney(salaryLeft):'—'}</b></div>
+            <div><span class="sw" style="background:#fff;box-shadow:var(--sunken-thin)"></span> Salary <b>${salary>0?fmtMoney(salary):'none received yet'}</b></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid grid-2" style="align-items:stretch;">
       <div class="card">
         <div class="section-title sm">Top places</div>
         ${topPlaces.length ? `<div class="barlist">${topPlaces.map(([label,val])=>`
@@ -562,12 +604,12 @@ function renderDashboard(){
   return renderPage('Dashboard', 'A quick look at where things stand.', '', body);
 }
 
-function orbitRingSvg(pct){
+function orbitRingSvg(pct, color){
   const r = 50, cx=60, cy=60, circ = 2*Math.PI*r;
   const dash = (Math.max(0,Math.min(100,pct))/100) * circ;
   return `<svg viewBox="0 0 120 120">
     <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#fff" stroke-width="16"/>
-    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#000080" stroke-width="16"
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="${color||'#000080'}" stroke-width="16"
       transform="rotate(-90 ${cx} ${cy})" stroke-dasharray="${dash} ${circ-dash}"/>
   </svg>`;
 }
@@ -1052,15 +1094,21 @@ function renderInPlaceStatement(){ render(); }
 function findOrCreateInternalTransferEntry(name, matches){
   let group = state.tagGroups.find(g => g.name === 'Internal Transfer');
   if(!group){
-    group = { id: uid('tg'), name:'Internal Transfer', savings:false, excludeFromSpending:true, entries:[] };
+    group = { id: uid('tg'), name:'Internal Transfer', savings:false, excludeFromSpending:true, subcategories:[] };
     state.tagGroups.push(group);
   }
-  let entry = group.entries.find(e => e.name === name);
+  group.subcategories = group.subcategories || [];
+  let sub = group.subcategories.find(s => s.name === name);
+  if(!sub){
+    sub = { id: uid('tsc'), name, entries:[] };
+    group.subcategories.push(sub);
+  }
+  let entry = sub.entries.find(e => e.name === name);
   if(!entry){
     entry = { id: uid('te'), name, matches: matches.slice() };
-    group.entries.push(entry);
+    sub.entries.push(entry);
   }
-  return { group, entry };
+  return { group, subcategory: sub, entry };
 }
 
 function openUsdConversionModal(accId){
@@ -1199,51 +1247,65 @@ function openNewTxModal(accId){
 }
 
 /* ---------------- tagging ---------------- */
+var tagModalState = { accId:null, txId:null, expandedGroup:null, expandedSub:null };
+
 function openTagModal(accId, txId){
+  tagModalState = { accId, txId, expandedGroup:null, expandedSub:null };
+  renderTagModal();
+}
+
+function renderTagModal(){
+  const { accId, txId } = tagModalState;
   const a = getAccount(accId); const tx = a.transactions.find(x=>x.id===txId);
-  const desc = tx.description || tx.altDescription || '';
   openModal(`
     <div class="modal-head"><div class="modal-title">Tag transaction</div><span class="x-close" data-action="closeModal">✕</span></div>
     <div class="faint" style="font-size:12px;margin-bottom:14px;">${escapeHtml(txDisplayDescription(tx))}</div>
-    <div id="tag-groups-wrap">${state.tagGroups.map(g=>tagGroupBlockHtml(g, accId, txId)).join('')}</div>
-    <div class="field" style="margin-top:14px;">
-      <label>New tag group</label>
-      <div class="row">
-        <input type="text" id="new-group-name" placeholder="e.g. Groceries" style="flex:1;">
-        <button class="btn sm" data-action="addTagGroup" data-id="${accId}" data-tx="${txId}">Add</button>
-      </div>
-    </div>
+    <div id="tag-tree-wrap">${renderTagTreeHtml()}</div>
+    <div class="hint" style="margin-top:10px;">Manage tags, subcategories, and places in Settings.</div>
     ${tx.tagGroupId ? `<div class="modal-actions" style="justify-content:flex-start;"><button class="btn ghost sm" data-action="clearTag" data-id="${accId}" data-tx="${txId}">Remove current tag</button></div>` : ''}
   `, {wide:true});
 }
 
-function tagGroupBlockHtml(g, accId, txId){
-  return `
-    <div class="tag-group-block">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-        <div style="font-weight:700;font-size:13px;">${escapeHtml(g.name)}</div>
+function renderTagTreeHtml(){
+  const { accId, txId, expandedGroup, expandedSub } = tagModalState;
+  return `<div class="tag-tree">${state.tagGroups.map(g=>{
+    const groupOpen = expandedGroup === g.id;
+    const subs = g.subcategories || [];
+    return `
+      <div class="tag-tree-row lvl1" data-action="toggleTagGroupExpand" data-group="${g.id}">
+        <span class="tag-tree-arrow">${groupOpen?'▾':'▸'}</span>
+        <span style="flex:1;">${escapeHtml(g.name)}</span>
         ${g.savings?'<span class="badge green">savings</span>':''}
       </div>
-      <div style="display:flex;flex-wrap:wrap;gap:7px;margin-bottom:8px;">
-        ${g.entries.map(e=>`<span class="tagchip" data-action="pickTagEntry" data-id="${accId}" data-tx="${txId}" data-group="${g.id}" data-entry="${e.id}"><span class="swatch"></span>${escapeHtml(e.name)}</span>`).join('') || '<span class="faint" style="font-size:12px;">No places yet.</span>'}
-      </div>
-      <div class="row">
-        <input type="text" placeholder="+ add a place / entry" class="new-entry-input" data-group="${g.id}" style="flex:1;">
-        <button class="btn sm" data-action="addTagEntry" data-id="${accId}" data-tx="${txId}" data-group="${g.id}">Add</button>
-      </div>
-    </div>
-  `;
+      ${groupOpen ? (subs.length ? subs.map(sub=>{
+        const subOpen = expandedSub === sub.id;
+        const entries = sub.entries || [];
+        return `
+          <div class="tag-tree-row lvl2" data-action="toggleTagSubExpand" data-sub="${sub.id}">
+            <span class="tag-tree-arrow">${subOpen?'▾':'▸'}</span>
+            <span style="flex:1;">${escapeHtml(sub.name)}</span>
+          </div>
+          ${subOpen ? (entries.length ? entries.map(e=>`
+            <div class="tag-tree-row lvl3" data-action="pickTagEntry" data-id="${accId}" data-tx="${txId}" data-group="${g.id}" data-entry="${e.id}">
+              <span class="swatch"></span>${escapeHtml(e.name)}
+            </div>`).join('') : `<div class="tag-tree-row lvl3 faint">No places here yet — add one in Settings.</div>`) : ''}
+        `;
+      }).join('') : `<div class="tag-tree-row lvl2 faint">No subcategories yet — add one in Settings.</div>`) : ''}
+    `;
+  }).join('')}</div>`;
 }
 
 function maybeLearnAndAssign(accId, txId, groupId, entryId){
   const a = getAccount(accId); const tx = a.transactions.find(x=>x.id===txId);
-  const g = state.tagGroups.find(x=>x.id===groupId); const entry = g.entries.find(x=>x.id===entryId);
+  const lk = tagLookup(groupId, entryId);
+  if(!lk) return;
   const desc = (tx.description || tx.altDescription || '').trim();
-  const already = desc && entry.matches.some(m=>desc.toUpperCase().includes(m.toUpperCase()));
+  const descUp = desc.toUpperCase();
+  const already = desc && lk.entry.matches.some(m => descUp.includes(m.toUpperCase()) || m.toUpperCase().includes(descUp));
   const assign = ()=>{ tx.tagGroupId=groupId; tx.tagEntryId=entryId; scheduleSave(); closeModal(); render(); };
   if(desc && !already){
-    confirmDialog('Make this permanent?', `Always tag future transactions from <b>${escapeHtml(desc)}</b> as <b>${escapeHtml(entry.name)}</b>?`, ()=>{
-      entry.matches.push(desc.toUpperCase()); assign();
+    confirmDialog('Make this permanent?', `Always tag future transactions from <b>${escapeHtml(desc)}</b> as <b>${escapeHtml(lk.entry.name)}</b>?`, ()=>{
+      lk.entry.matches.push(descUp); assign();
     }, 'Yes, always');
     // also allow "just this once" — wire cancel to assign without learning
     setTimeout(()=>{
@@ -1255,28 +1317,19 @@ function maybeLearnAndAssign(accId, txId, groupId, entryId){
 
 ACTIONS.newTx = (t)=> openNewTxModal(t.dataset.id);
 ACTIONS.tagTx = (t)=> openTagModal(t.dataset.id, t.dataset.tx);
+ACTIONS.toggleTagGroupExpand = (t)=>{
+  const gid = t.dataset.group;
+  tagModalState.expandedGroup = (tagModalState.expandedGroup === gid) ? null : gid;
+  tagModalState.expandedSub = null;
+  renderTagModal();
+};
+ACTIONS.toggleTagSubExpand = (t)=>{
+  const sid = t.dataset.sub;
+  tagModalState.expandedSub = (tagModalState.expandedSub === sid) ? null : sid;
+  renderTagModal();
+};
 ACTIONS.pickTagEntry = (t)=> maybeLearnAndAssign(t.dataset.id, t.dataset.tx, t.dataset.group, t.dataset.entry);
 ACTIONS.clearTag = (t)=>{ const a=getAccount(t.dataset.id); const tx=a.transactions.find(x=>x.id===t.dataset.tx); tx.tagGroupId=null; tx.tagEntryId=null; scheduleSave(); closeModal(); render(); };
-ACTIONS.addTagGroup = (t)=>{
-  const input = document.getElementById('new-group-name'); const name = input.value.trim();
-  if(!name) return;
-  const g = { id: uid('tg'), name, savings:false, entries:[] };
-  state.tagGroups.push(g); scheduleSave();
-  openTagModal(t.dataset.id, t.dataset.tx);
-};
-ACTIONS.addTagEntry = (t)=>{
-  const wrap = t.closest('.tag-group-block');
-  const input = wrap.querySelector('.new-entry-input'); const name = input.value.trim();
-  if(!name) return;
-  const g = state.tagGroups.find(x=>x.id===t.dataset.group);
-  const a = getAccount(t.dataset.id); const tx = a.transactions.find(x=>x.id===t.dataset.tx);
-  const desc = (tx.description || tx.altDescription || '').trim();
-  const entry = { id: uid('te'), name, matches: desc ? [desc.toUpperCase()] : [] };
-  g.entries.push(entry);
-  tx.tagGroupId = g.id; tx.tagEntryId = entry.id;
-  scheduleSave(); closeModal(); render();
-  toast(`Tagged as ${name}`,'success');
-};
 /* =========================================================
    Part 7: CSV statement import
    ========================================================= */
@@ -1608,10 +1661,7 @@ const FLOW_PALETTE = ['#000080','#800080','#008080','#808000','#800000','#0000ff
 
 function yearsWithData(){
   const set = new Set();
-  for(const acc of state.accounts) for(const tx of liveTx(acc)){
-    set.add(Number(tx.date.slice(0,4)));
-    if(tx.credit && tx.isIncome) set.add(Number(attributedMonthKey(tx.date).slice(0,4)));
-  }
+  for(const acc of state.accounts) for(const tx of liveTx(acc)) set.add(Number(attributedMonthKey(tx.date).slice(0,4)));
   set.add(new Date().getFullYear());
   return [...set].sort((a,b)=>b-a);
 }
@@ -1621,11 +1671,9 @@ function computeYearFlow(year){
   let income = 0;
   for(const acc of state.accounts){
     for(const tx of liveTx(acc)){
-      if(tx.credit && tx.isIncome){
-        const attributedYear = Number(attributedMonthKey(tx.date).slice(0,4));
-        if(attributedYear === year) income += convertToMVR(tx.credit, acc.currency) || 0;
-      }
-      if(tx.debit && Number(tx.date.slice(0,4)) === year){
+      if(Number(attributedMonthKey(tx.date).slice(0,4)) !== year) continue;
+      if(tx.credit && tx.isIncome) income += convertToMVR(tx.credit, acc.currency) || 0;
+      if(tx.debit){
         const mvr = convertToMVR(tx.debit, acc.currency) || 0;
         const g = tx.tagGroupId ? state.tagGroups.find(x=>x.id===tx.tagGroupId) : null;
         const key = g ? g.id : '__untagged__';
@@ -1736,9 +1784,9 @@ function renderSettings(){
           <input type="text" id="set-income-codes" value="${escapeHtml(state.settings.incomeCodes.join(', '))}">
           <div class="hint">Comma-separated, e.g. salary, bonus. You can still flag individual transactions on their statement row.</div>
         </div>
-        <div class="field"><label>Salary posted on/after day of month…</label>
-          <input type="number" min="1" max="31" step="1" id="set-salary-cutoff" value="${state.settings.salaryCutoffDay||28}">
-          <div class="hint">…counts toward next month's salary. E.g. with 28, a salary paid Aug 28 shows as September's income.</div>
+        <div class="field"><label>Financial month starts on day…</label>
+          <input type="number" min="1" max="31" step="1" id="set-salary-cutoff" value="${state.settings.financialMonthStartDay||28}">
+          <div class="hint">A transaction dated on/after this day — income or spending — counts toward next month. E.g. with 28, anything from Aug 28 onward is treated as September's.</div>
         </div>
         <button class="btn primary sm" id="save-settings-btn">Save</button>
       </div>
@@ -1804,17 +1852,35 @@ function tagSettingsBlockHtml(g){
         <label class="checkline"><input type="checkbox" class="tag-group-exclude" data-group="${g.id}" ${g.excludeFromSpending?'checked':''}> Exclude from spending</label>
         <span class="x-close" data-action="deleteTagGroup" data-group="${g.id}">✕ delete group</span>
       </div>
-      <div style="margin-top:10px;">
-        ${g.entries.map(e=>`
-          <div class="tag-entry-row">
-            <input type="text" class="tag-entry-name" data-group="${g.id}" data-entry="${e.id}" value="${escapeHtml(e.name)}" style="width:140px;flex:none;">
-            <input type="text" class="tag-entry-matches" data-group="${g.id}" data-entry="${e.id}" value="${escapeHtml((e.matches||[]).join(', '))}" placeholder="match keywords, comma-separated" style="flex:1;">
-            <span class="x-close" data-action="deleteTagEntry" data-group="${g.id}" data-entry="${e.id}">✕</span>
-          </div>`).join('')}
+      <div style="margin-top:10px;padding-left:14px;box-shadow:inset 2px 0 0 var(--shadow);">
+        ${(g.subcategories||[]).map(sub=>tagSubcategoryBlockHtml(g, sub)).join('') || '<div class="faint" style="font-size:11.5px;margin-bottom:8px;">No subcategories yet.</div>'}
+        <div class="row">
+          <input type="text" class="new-subcategory-input" data-group="${g.id}" placeholder="+ add a subcategory, e.g. AI Subscription">
+          <button class="btn sm" data-action="addSubcategory" data-group="${g.id}">Add</button>
+        </div>
       </div>
-      <div class="row" style="margin-top:8px;">
-        <input type="text" class="new-tag-entry-input" data-group="${g.id}" placeholder="+ add a place / entry">
-        <button class="btn sm" data-action="addTagEntrySettings" data-group="${g.id}">Add</button>
+    </div>
+  `;
+}
+
+function tagSubcategoryBlockHtml(g, sub){
+  return `
+    <div class="tag-sub-block">
+      <div style="display:flex;align-items:center;gap:8px;">
+        <input type="text" class="tag-sub-name" data-group="${g.id}" data-sub="${sub.id}" value="${escapeHtml(sub.name)}" style="font-weight:700;flex:1;">
+        <span class="x-close" data-action="deleteSubcategory" data-group="${g.id}" data-sub="${sub.id}">✕</span>
+      </div>
+      <div style="margin-top:8px;padding-left:12px;">
+        ${(sub.entries||[]).map(e=>`
+          <div class="tag-entry-row">
+            <input type="text" class="tag-entry-name" data-group="${g.id}" data-sub="${sub.id}" data-entry="${e.id}" value="${escapeHtml(e.name)}" style="width:140px;flex:none;">
+            <input type="text" class="tag-entry-matches" data-group="${g.id}" data-sub="${sub.id}" data-entry="${e.id}" value="${escapeHtml((e.matches||[]).join(', '))}" placeholder="match keywords, comma-separated" style="flex:1;">
+            <span class="x-close" data-action="deleteTagEntry" data-group="${g.id}" data-sub="${sub.id}" data-entry="${e.id}">✕</span>
+          </div>`).join('')}
+        <div class="row" style="margin-top:6px;">
+          <input type="text" class="new-tag-entry-input" data-group="${g.id}" data-sub="${sub.id}" placeholder="+ add a place, e.g. ChatGPT">
+          <button class="btn sm" data-action="addTagEntrySettings" data-group="${g.id}" data-sub="${sub.id}">Add</button>
+        </div>
       </div>
     </div>
   `;
@@ -1909,7 +1975,7 @@ AFTER_RENDER_HOOKS.settings = function(){
     state.settings.monthlyBudget = parseAmount(document.getElementById('set-budget').value);
     state.settings.exchangeRates.USD = parseAmount(document.getElementById('set-usd-rate').value) || state.settings.exchangeRates.USD;
     state.settings.incomeCodes = document.getElementById('set-income-codes').value.split(',').map(s=>s.trim()).filter(Boolean);
-    state.settings.salaryCutoffDay = Math.min(31, Math.max(1, Math.round(parseAmount(document.getElementById('set-salary-cutoff').value)) || 28));
+    state.settings.financialMonthStartDay = Math.min(31, Math.max(1, Math.round(parseAmount(document.getElementById('set-salary-cutoff').value)) || 28));
     scheduleSave(); toast('Settings saved','success'); render();
   };
   document.querySelectorAll('.tag-group-name').forEach(inp=>inp.addEventListener('change',()=>{
@@ -1921,12 +1987,18 @@ AFTER_RENDER_HOOKS.settings = function(){
   document.querySelectorAll('.tag-group-exclude').forEach(inp=>inp.addEventListener('change',()=>{
     const g = state.tagGroups.find(x=>x.id===inp.dataset.group); g.excludeFromSpending = inp.checked; scheduleSave();
   }));
+  document.querySelectorAll('.tag-sub-name').forEach(inp=>inp.addEventListener('change',()=>{
+    const g = state.tagGroups.find(x=>x.id===inp.dataset.group); const sub = g.subcategories.find(x=>x.id===inp.dataset.sub);
+    sub.name = inp.value.trim()||sub.name; scheduleSave();
+  }));
   document.querySelectorAll('.tag-entry-name').forEach(inp=>inp.addEventListener('change',()=>{
-    const g = state.tagGroups.find(x=>x.id===inp.dataset.group); const e = g.entries.find(x=>x.id===inp.dataset.entry);
+    const g = state.tagGroups.find(x=>x.id===inp.dataset.group); const sub = g.subcategories.find(x=>x.id===inp.dataset.sub);
+    const e = sub.entries.find(x=>x.id===inp.dataset.entry);
     e.name = inp.value.trim()||e.name; scheduleSave();
   }));
   document.querySelectorAll('.tag-entry-matches').forEach(inp=>inp.addEventListener('change',()=>{
-    const g = state.tagGroups.find(x=>x.id===inp.dataset.group); const e = g.entries.find(x=>x.id===inp.dataset.entry);
+    const g = state.tagGroups.find(x=>x.id===inp.dataset.group); const sub = g.subcategories.find(x=>x.id===inp.dataset.sub);
+    const e = sub.entries.find(x=>x.id===inp.dataset.entry);
     e.matches = inp.value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean); scheduleSave();
   }));
   const importFile = document.getElementById('import-data-file');
@@ -1946,28 +2018,49 @@ ACTIONS.deleteAccountType = (t)=>{
 ACTIONS.addTagGroupSettings = ()=>{
   const inp = document.getElementById('new-tag-group-input'); const v = inp.value.trim();
   if(!v) return;
-  state.tagGroups.push({ id: uid('tg'), name:v, savings:false, entries:[] }); scheduleSave(); render();
+  state.tagGroups.push({ id: uid('tg'), name:v, savings:false, subcategories:[] }); scheduleSave(); render();
 };
 ACTIONS.deleteTagGroup = (t)=>{
   const id = t.dataset.group;
-  confirmDialog('Delete this tag group?','Transactions tagged with it will become untagged.',()=>{
+  confirmDialog('Delete this tag group?','Its subcategories and places go with it, and any tagged transactions will become untagged.',()=>{
     state.tagGroups = state.tagGroups.filter(g=>g.id!==id);
     state.accounts.forEach(a=>a.transactions.forEach(tx=>{ if(tx.tagGroupId===id){ tx.tagGroupId=null; tx.tagEntryId=null; } }));
     scheduleSave(); render();
   }, 'Delete', true);
 };
+ACTIONS.addSubcategory = (t)=>{
+  const wrap = t.closest('.tag-group-block');
+  const inp = wrap.querySelector('.new-subcategory-input'); const v = inp.value.trim();
+  if(!v) return;
+  const g = state.tagGroups.find(x=>x.id===t.dataset.group);
+  g.subcategories = g.subcategories || [];
+  g.subcategories.push({ id: uid('tsc'), name:v, entries:[] });
+  scheduleSave(); render();
+};
+ACTIONS.deleteSubcategory = (t)=>{
+  const g = state.tagGroups.find(x=>x.id===t.dataset.group);
+  confirmDialog('Delete this subcategory?','Its places go with it, and any tagged transactions will become untagged.',()=>{
+    const sub = g.subcategories.find(s=>s.id===t.dataset.sub);
+    const entryIds = new Set((sub && sub.entries || []).map(e=>e.id));
+    g.subcategories = g.subcategories.filter(s=>s.id!==t.dataset.sub);
+    state.accounts.forEach(a=>a.transactions.forEach(tx=>{ if(entryIds.has(tx.tagEntryId)){ tx.tagGroupId=null; tx.tagEntryId=null; } }));
+    scheduleSave(); render();
+  }, 'Delete', true);
+};
 ACTIONS.deleteTagEntry = (t)=>{
   const g = state.tagGroups.find(x=>x.id===t.dataset.group);
-  g.entries = g.entries.filter(e=>e.id!==t.dataset.entry);
+  const sub = g.subcategories.find(s=>s.id===t.dataset.sub);
+  sub.entries = sub.entries.filter(e=>e.id!==t.dataset.entry);
   state.accounts.forEach(a=>a.transactions.forEach(tx=>{ if(tx.tagEntryId===t.dataset.entry){ tx.tagGroupId=null; tx.tagEntryId=null; } }));
   scheduleSave(); render();
 };
 ACTIONS.addTagEntrySettings = (t)=>{
-  const wrap = t.closest('.tag-group-block');
+  const wrap = t.closest('.tag-sub-block');
   const inp = wrap.querySelector('.new-tag-entry-input'); const v = inp.value.trim();
   if(!v) return;
   const g = state.tagGroups.find(x=>x.id===t.dataset.group);
-  g.entries.push({ id: uid('te'), name:v, matches:[] });
+  const sub = g.subcategories.find(s=>s.id===t.dataset.sub);
+  sub.entries.push({ id: uid('te'), name:v, matches:[] });
   scheduleSave(); render();
 };
 ACTIONS.newAccountSinking = ()=>{
