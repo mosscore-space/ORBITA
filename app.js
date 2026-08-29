@@ -44,6 +44,7 @@ var dataReady = false;
 var githubSyncTimer = null;
 var githubFileSha = null;
 var githubLastSync = null; // {ok, time, message}
+var githubSyncInFlight = false;
 
 /* ---------------- local storage (always on, this device only) ---------------- */
 function mergeIntoState(parsed){
@@ -156,8 +157,12 @@ async function saveNow(){
   if(cfg && cfg.token && cfg.autoSync){
     clearTimeout(githubSyncTimer);
     githubSyncTimer = setTimeout(async ()=>{
+      githubSyncInFlight = true;
+      if(typeof updateStatusBar==='function') updateStatusBar();
       try{ await githubSaveState(cfg); githubLastSync = { ok:true, time:new Date().toISOString() }; }
       catch(e){ githubLastSync = { ok:false, time:new Date().toISOString(), message:e.message }; toast('GitHub sync failed — your data is still saved locally', 'error'); }
+      githubSyncInFlight = false;
+      if(typeof updateStatusBar==='function') updateStatusBar();
       if(route.view==='settings') render();
     }, 1400);
   }
@@ -277,6 +282,12 @@ function convertToMVR(amount, currency){
   if(currency==='USD') return amount * (state.settings.exchangeRates.USD||0);
   if(currency==='EUR') return state.settings.exchangeRates.EUR ? amount*state.settings.exchangeRates.EUR : null;
   return amount;
+}
+function netWorthMVR(){
+  return state.accounts.filter(a=>!a.closed).reduce((s,a)=>{
+    const conv = convertToMVR(accountTotal(a), a.currency);
+    return s + (conv==null?0:conv);
+  },0);
 }
 /* =========================================================
    Part 2: shell — nav, router, modal helpers
@@ -441,10 +452,7 @@ function renderDashboard(){
   const left = budget - spent;
   const pct = budget>0 ? Math.min(100, (spent/budget)*100) : 0;
 
-  const netWorthMVR = state.accounts.filter(a=>!a.closed).reduce((s,a)=>{
-    const conv = convertToMVR(accountTotal(a), a.currency);
-    return s + (conv==null?0:conv);
-  },0);
+  const netWorth = netWorthMVR();
   const eurAccounts = state.accounts.filter(a=>!a.closed && a.currency==='EUR');
 
   const topPlaces = Object.entries(placeMap).sort((a,b)=>b[1]-a[1]).slice(0,6);
@@ -484,25 +492,31 @@ function renderDashboard(){
       </div>
       <div class="card stat-card">
         <div class="stat-label">Net worth</div>
-        <div class="stat-value">${fmtMoney(netWorthMVR)}<small>MVR≈</small></div>
+        <div class="stat-value">${fmtMoney(netWorth)}<small>MVR≈</small></div>
         <div class="stat-foot">${eurAccounts.length? eurAccounts.length+' EUR account(s) not converted':'across all open accounts'}</div>
       </div>
     </div>
 
     <div class="grid grid-3" style="align-items:stretch;">
-      <div class="card" style="display:flex;flex-direction:column;align-items:center;gap:14px;">
-        <div class="section-title sm" style="align-self:flex-start;">Budget used</div>
-        <div class="orbit-wrap">${orbitRingSvg(pct)}
-          <div class="orbit-center">
-            <div class="pct">${budget>0?Math.round(pct)+'%':'—'}</div>
-            <div class="lbl">${monthLabel(mk)}</div>
+      <div class="card">
+        <div class="section-title sm">Budget used</div>
+        <div class="donut9">
+          <div class="orbit-wrap">${orbitRingSvg(pct)}
+            <div class="orbit-center">
+              <div class="pct">${budget>0?Math.round(pct)+'%':'—'}</div>
+              <div class="lbl">${monthLabel(mk)}</div>
+            </div>
+          </div>
+          <div class="dn-legend">
+            <div><span class="sw" style="background:#000080"></span> Spent <b>${fmtMoney(spent)}</b></div>
+            <div><span class="sw" style="background:#fff;box-shadow:var(--sunken-thin)"></span> Budget <b>${budget>0?fmtMoney(budget):'not set'}</b></div>
+            <div style="margin-top:4px;">${monthNav}</div>
           </div>
         </div>
-        <div style="display:flex;gap:10px;align-items:center;">${monthNav}</div>
       </div>
 
       <div class="card">
-        <div class="section-title sm" style="margin-bottom:14px;">Top places</div>
+        <div class="section-title sm">Top places</div>
         ${topPlaces.length ? `<div class="barlist">${topPlaces.map(([label,val])=>`
           <div class="barlist-row">
             <div class="lbl" title="${escapeHtml(label)}">${escapeHtml(label)}</div>
@@ -512,7 +526,7 @@ function renderDashboard(){
       </div>
 
       <div class="card">
-        <div class="section-title sm" style="margin-bottom:14px;">Top purposes</div>
+        <div class="section-title sm">Top purposes</div>
         ${topPurposes.length ? `<div class="barlist">${topPurposes.map(([label,val])=>`
           <div class="barlist-row">
             <div class="lbl" title="${escapeHtml(label)}">${escapeHtml(label)}</div>
@@ -523,7 +537,7 @@ function renderDashboard(){
     </div>
 
     <div class="card" style="margin-top:16px;">
-      <div class="section-title sm" style="margin-bottom:14px;">Spending, last 6 months</div>
+      <div class="section-title sm">Spending, last 6 months</div>
       <div style="height:220px;"><canvas id="monthlyChart"></canvas></div>
     </div>
   `;
@@ -533,12 +547,12 @@ function renderDashboard(){
 }
 
 function orbitRingSvg(pct){
-  const r = 62, cx=75, cy=75, circ = 2*Math.PI*r;
+  const r = 50, cx=60, cy=60, circ = 2*Math.PI*r;
   const dash = (Math.max(0,Math.min(100,pct))/100) * circ;
-  return `<svg viewBox="0 0 150 150">
-    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#0d3322" stroke-width="10"/>
-    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#39ff6a" stroke-width="10"
-      stroke-linecap="butt" stroke-dasharray="${dash} ${circ-dash}" style="filter:drop-shadow(0 0 4px #39ff6a);"/>
+  return `<svg viewBox="0 0 120 120">
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#fff" stroke-width="16"/>
+    <circle cx="${cx}" cy="${cy}" r="${r}" fill="none" stroke="#000080" stroke-width="16"
+      transform="rotate(-90 ${cx} ${cy})" stroke-dasharray="${dash} ${circ-dash}"/>
   </svg>`;
 }
 
@@ -1884,9 +1898,35 @@ function updateTaskbarLabel(){
   const nav = NAV_ITEMS.find(n => n.key === route.view);
   label.textContent = nav ? nav.label : 'Orbita';
 }
-// wrap the existing render() so every navigation keeps the taskbar label in sync
+
+function updateStatusBar(){
+  const ctxEl = document.getElementById('sbContext');
+  if(!ctxEl) return;
+  const nav = NAV_ITEMS.find(n => n.key === route.view);
+  ctxEl.textContent = 'Orbita — ' + (nav ? nav.label : '');
+
+  const ledEl = document.getElementById('sbLed');
+  const syncEl = document.getElementById('sbSyncText');
+  const cfg = loadGithubConfig();
+  if(githubSyncInFlight){
+    ledEl.className = 'led load'; syncEl.textContent = 'Syncing…';
+  } else if(!cfg || !cfg.token){
+    ledEl.className = 'led'; syncEl.textContent = 'Local only';
+  } else if(githubLastSync && githubLastSync.ok){
+    ledEl.className = 'led ok'; syncEl.textContent = 'Synced ' + new Date(githubLastSync.time).toLocaleTimeString();
+  } else if(githubLastSync && !githubLastSync.ok){
+    ledEl.className = 'led err'; syncEl.textContent = 'Sync error';
+  } else {
+    ledEl.className = 'led stale'; syncEl.textContent = 'Not yet synced';
+  }
+
+  const balEl = document.getElementById('sbBalance');
+  balEl.textContent = fmtMoney(netWorthMVR()) + ' MVR';
+}
+
+// wrap the existing render() so every navigation keeps the taskbar label + status bar in sync
 var _baseRender = render;
-render = function(){ _baseRender(); updateTaskbarLabel(); };
+render = function(){ _baseRender(); updateTaskbarLabel(); updateStatusBar(); };
 
 ACTIONS.toggleStartMenu = ()=>{
   document.getElementById('start-menu').classList.toggle('hidden');
