@@ -1150,7 +1150,7 @@ function openNewTxModal(accId){
           <input type="hidden" name="dir" value="debit">
         </div>
       </div>
-      <div class="field"><label>Description</label><input type="text" name="description" placeholder="e.g. Nisal Mart" required></div>
+      <div class="field"><label>Note (optional)</label><input type="text" name="description" placeholder="What was this for? e.g. lunch with the team"></div>
       <div class="row">
         <div class="field"><label>Amount (${a.currency})</label><input type="number" step="0.01" name="amount" required></div>
         <div class="field"><label>Category code (optional)</label><input type="text" name="code" placeholder="e.g. Purchase"></div>
