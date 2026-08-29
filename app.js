@@ -480,7 +480,7 @@ function renderDashboard(){
   const monthNav = `
     <button class="btn icon ghost" data-action="dashPrevMonth" title="Previous month">‹</button>
     <div class="badge grad" style="min-width:110px;justify-content:center">${monthLabel(mk)}</div>
-    <button class="btn icon ghost" data-action="dashNextMonth" title="Next month" ${mk>=currentMonthKey()?'disabled':''}>›</button>
+    <button class="btn icon ghost" data-action="dashNextMonth" title="Next month" ${mk>=maxDashboardMonth()?'disabled':''}>›</button>
   `;
 
   const body = `
@@ -609,7 +609,11 @@ function showUnmatchedModal(){
 
 AFTER_RENDER_HOOKS.dashboard = drawMonthlyChart;
 ACTIONS.dashPrevMonth = ()=>{ dashboardMonth = monthDelta(dashboardMonth,-1); render(); };
-ACTIONS.dashNextMonth = ()=>{ if(dashboardMonth<currentMonthKey()){ dashboardMonth = monthDelta(dashboardMonth,1); render(); } };
+ACTIONS.dashNextMonth = ()=>{ if(dashboardMonth<maxDashboardMonth()){ dashboardMonth = monthDelta(dashboardMonth,1); render(); } };
+// You can always peek one month ahead of the real calendar month — salary paid
+// near month-end is attributed to next month (see attributedMonthKey), so next
+// month's dashboard needs to be viewable before the calendar actually turns over.
+function maxDashboardMonth(){ return monthDelta(currentMonthKey(), 1); }
 ACTIONS.showUnmatched = showUnmatchedModal;
 ACTIONS.openLiability = (t)=>{ closeModal(); go('liabilities',{id:t.dataset.id}); };
 ACTIONS.openAccount = (t)=>{ closeModal(); go('accounts',{id:t.dataset.id}); };
