@@ -28,6 +28,7 @@ function defaultState(){
       monthlyBudget: 0,
       incomeCodes: ['salary','bonus'],
       salaryCutoffDay: 28, // salary posted on/after this day of the month counts toward NEXT month
+      usdConversion: { mvrAmount: 3084, usdAmount: 200 }, // default amounts for the monthly MVR→USD conversion
     },
     tagGroups: [
       { id: uid('tg'), name:'Shop', savings:false, entries:[] },
@@ -826,6 +827,8 @@ function renderAccountDetail(id){
         <div style="display:flex;gap:8px;">
           <button class="btn ghost sm" data-action="editAccount" data-id="${a.id}">Edit</button>
           <button class="btn sm" data-action="openImport" data-id="${a.id}">⇩ Import statement</button>
+          ${a.currency!=='USD' && state.accounts.some(x=>x.currency==='USD' && x.id!==a.id && !x.closed) ?
+            `<button class="btn sm" data-action="openUsdConversion" data-id="${a.id}">💱 Convert to USD</button>` : ''}
           <button class="btn primary sm" data-action="newTx" data-id="${a.id}">+ Add transaction</button>
         </div>
       </div>
@@ -1036,6 +1039,91 @@ AFTER_RENDER_HOOKS.accounts = function(){
   });
 };
 function renderInPlaceStatement(){ render(); }
+
+/* =========================================================
+   Monthly MVR → USD conversion
+   ---------------------------------------------------------
+   Debits a fixed MVR amount from this account and credits a
+   fixed USD amount to a destination account chosen fresh each
+   time. Both legs share a transferGroupId and are tagged under
+   "Internal Transfer" (excluded from spending) so they don't
+   skew the dashboard's spending totals.
+   ========================================================= */
+function findOrCreateInternalTransferEntry(name, matches){
+  let group = state.tagGroups.find(g => g.name === 'Internal Transfer');
+  if(!group){
+    group = { id: uid('tg'), name:'Internal Transfer', savings:false, excludeFromSpending:true, entries:[] };
+    state.tagGroups.push(group);
+  }
+  let entry = group.entries.find(e => e.name === name);
+  if(!entry){
+    entry = { id: uid('te'), name, matches: matches.slice() };
+    group.entries.push(entry);
+  }
+  return { group, entry };
+}
+
+function openUsdConversionModal(accId){
+  const a = getAccount(accId);
+  const usdAccounts = state.accounts.filter(x => x.currency==='USD' && x.id!==a.id && !x.closed);
+  if(!usdAccounts.length){ toast('No open USD account to convert into yet', 'error'); return; }
+  const cfg = state.settings.usdConversion || { mvrAmount:3084, usdAmount:200 };
+  openModal(`
+    <div class="modal-head"><div class="modal-title">Convert to USD</div><span class="x-close" data-action="closeModal">✕</span></div>
+    <form id="usd-conv-form">
+      <div class="field"><label>Date</label><input type="date" name="date" value="${todayIso()}" required></div>
+      <div class="row">
+        <div class="field"><label>MVR debited from ${escapeHtml(a.name)}</label><input type="number" step="0.01" name="mvrAmount" value="${cfg.mvrAmount}" required></div>
+        <div class="field"><label>USD credited</label><input type="number" step="0.01" name="usdAmount" value="${cfg.usdAmount}" required></div>
+      </div>
+      <div class="field"><label>Which dollar account?</label>
+        <select name="destAccountId">${usdAccounts.map(x=>`<option value="${x.id}">${escapeHtml(x.name)}</option>`).join('')}</select>
+      </div>
+      <div class="hint" style="margin-bottom:12px;">Records this as an internal transfer, not spending or income — matches your bank's monthly "STAFF USD" standing order, so it'll link up automatically next time you import that statement.</div>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" data-action="closeModal">Cancel</button>
+        <button type="submit" class="btn primary">Realize conversion</button>
+      </div>
+    </form>
+  `);
+  document.getElementById('usd-conv-form').onsubmit = (e)=>{
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const date = f.get('date');
+    const mvrAmount = parseAmount(f.get('mvrAmount'));
+    const usdAmount = parseAmount(f.get('usdAmount'));
+    const dest = getAccount(f.get('destAccountId'));
+    if(!dest || mvrAmount<=0 || usdAmount<=0) return;
+
+    const doRealize = ()=>{
+      const transferGroupId = uid('xfer');
+      const { group, entry } = findOrCreateInternalTransferEntry('USD Conversion', ['STAFF USD']);
+      a.transactions.push({
+        id: uid('tx'), date, code:'Standing Order', uniqueId:null,
+        description:'STAFF USD', altDescription:'', descriptionOverride:null,
+        debit: mvrAmount, credit:0, balance:null,
+        tagGroupId: group.id, tagEntryId: entry.id, envelopeId:null,
+        source:'manual', matched:false, isIncome:false, transferGroupId, _seq: Date.now(),
+      });
+      dest.transactions.push({
+        id: uid('tx'), date, code:'Standing Order', uniqueId:null,
+        description:'Salary USD conversion', altDescription:'', descriptionOverride:null,
+        debit:0, credit: usdAmount, balance:null,
+        tagGroupId: group.id, tagEntryId: entry.id, envelopeId:null,
+        source:'manual', matched:false, isIncome:false, transferGroupId, _seq: Date.now()+1,
+      });
+      state.settings.usdConversion = { mvrAmount, usdAmount };
+      scheduleSave(); closeModal(); render();
+      toast(`Converted ${fmtMoney(mvrAmount)} MVR → ${fmtMoney(usdAmount)} USD`, 'success');
+    };
+
+    const dup = findPossibleDuplicate(a, date, mvrAmount, true);
+    if(dup){
+      confirmDialog('Possible duplicate', `There's already a debit of ${fmtMoney(mvrAmount)} around ${fmtDate(date)} in ${escapeHtml(a.name)} (${escapeHtml(txDisplayDescription(dup))}). Realize this conversion anyway?`, doRealize, 'Realize anyway');
+    } else doRealize();
+  };
+}
+ACTIONS.openUsdConversion = (t)=> openUsdConversionModal(t.dataset.id);
 /* =========================================================
    Part 6: manual transactions + tagging
    ========================================================= */
@@ -1199,12 +1287,21 @@ function parseStatementCSV(text){
     if(!r || !r[0]) continue;
     const date = toIsoDate(cleanCsvField(r[0]));
     if(!/^\d{4}-\d{2}-\d{2}$/.test(date)) continue; // skip header/garbage rows
+    const dRaw = cleanCsvField(r[3]);
+    const eRaw = cleanCsvField(r[4]);
+    const gDesc = cleanCsvField(r[6]);
     out.push({
       date,
       code: cleanCsvField(r[2]),
-      uniqueId: cleanCsvField(r[3]),
+      // D alone isn't reliably unique — recurring standing orders (e.g. "STAFF USD")
+      // reuse the exact same D value every month, so combine it with the E-column
+      // reference, which is genuinely unique per transaction across the whole statement.
+      uniqueId: dRaw + '|' + eRaw,
       altDescription: cleanCsvField(r[5]),
-      description: cleanCsvField(r[6]),
+      // Some standing-order rows leave G blank; when that happens, D often holds a
+      // human-readable label instead of a reference code (e.g. "STAFF USD" rather
+      // than an alphanumeric ID) — fall back to it when it reads like a label.
+      description: gDesc || (dRaw.includes(' ') ? dRaw : ''),
       debit: parseAmount(cleanCsvField(r[8])),
       credit: parseAmount(cleanCsvField(r[9])),
       balance: r[10]!==undefined ? parseAmount(cleanCsvField(r[10])) : null,
