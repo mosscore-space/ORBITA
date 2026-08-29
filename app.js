@@ -1685,9 +1685,23 @@ function computeYearFlow(year){
   return { income, categories: Object.values(cats).filter(c=>c.amount>0.005) };
 }
 
+// Beyond a handful of categories, thin slivers get unreadable no matter how
+// much space they're given — fold the smallest ones into "Other" so every
+// visible label has room to breathe.
+function consolidateCategories(categories, maxVisible){
+  if(categories.length <= maxVisible) return categories.slice();
+  const sorted = categories.slice().sort((a,b)=> (b.savings-a.savings) || (b.amount-a.amount));
+  const kept = sorted.slice(0, maxVisible - 1);
+  const rest = sorted.slice(maxVisible - 1);
+  const otherAmount = rest.reduce((s,c)=>s+c.amount, 0);
+  if(otherAmount > 0.005) kept.push({ name:'Other', savings:false, amount:otherAmount, other:true });
+  return kept;
+}
+
 function renderFlow(){
-  const { income, categories } = computeYearFlow(flowYear);
-  categories.sort((a,b)=> (b.savings-a.savings) || (b.amount-a.amount));
+  const { income, categories: rawCategories } = computeYearFlow(flowYear);
+  const categories = consolidateCategories(rawCategories, 7);
+  categories.sort((a,b)=> (b.savings-a.savings) || (a.other?1:0)-(b.other?1:0) || (b.amount-a.amount));
   const totalOut = categories.reduce((s,c)=>s+c.amount,0);
   const leftover = income - totalOut;
 
@@ -1695,10 +1709,10 @@ function renderFlow(){
     <div class="empty"><div class="t">No flow to show for ${flowYear}</div>
     <div style="font-size:12.5px;">Mark some credit transactions as income, and tag your spending, to see the year come together here.</div></div>
   ` : `
-    <div class="card sankey-wrap">
+    <div class="card sankey-wrap" id="sankey-fit-wrap">
       ${sankeySvg(income, categories, leftover)}
     </div>
-    <div class="grid grid-3" style="margin-top:16px;">
+    <div class="grid grid-3" id="flow-stats-grid" style="margin-top:16px;">
       <div class="card card-tight"><div class="stat-label">Income</div><div class="stat-value" style="font-size:19px;">${fmtMoney(income)}</div></div>
       <div class="card card-tight"><div class="stat-label">Savings</div><div class="stat-value" style="font-size:19px;color:var(--green);">${fmtMoney(categories.filter(c=>c.savings).reduce((s,c)=>s+c.amount,0))}</div></div>
       <div class="card card-tight"><div class="stat-label">Spent</div><div class="stat-value" style="font-size:19px;">${fmtMoney(categories.filter(c=>!c.savings).reduce((s,c)=>s+c.amount,0))}</div></div>
@@ -1711,19 +1725,24 @@ function renderFlow(){
 }
 
 function sankeySvg(income, categories, leftover){
-  const W = 760, H = 440, pad = 20;
+  // Fixed internal coordinate system — the wrapping div is sized to the
+  // actual viewport by sizeSankeyToFit(), and preserveAspectRatio="none"
+  // lets this stretch to fill it exactly, both directions, no scrolling.
+  const W = 900, H = 480, pad = 20;
   const nodeW = 18;
+  const minNodeH = 26; // enough room for one legible label line, never overlaps a neighbor
+  const gap = 14;
   const leftX = pad, rightX = W - pad - nodeW;
   const denom = Math.max(income, categories.reduce((s,c)=>s+c.amount,0), 1);
   const usableH = H - pad*2;
-  const incomeH = Math.max(6, (income/denom) * usableH);
+  const incomeH = Math.max(minNodeH, (income/denom) * usableH);
   const incomeY = pad + (usableH - incomeH)/2;
 
-  let nodes = categories.map(c => ({ ...c, h: Math.max(6, (c.amount/denom)*usableH) }));
-  if(leftover > 0.01) nodes.push({ name:'Left over', amount:leftover, savings:false, leftover:true, h: Math.max(6,(leftover/denom)*usableH) });
+  let nodes = categories.map(c => ({ ...c, h: Math.max(minNodeH, (c.amount/denom)*usableH) }));
+  if(leftover > 0.01) nodes.push({ name:'Left over', amount:leftover, savings:false, leftover:true, h: Math.max(minNodeH,(leftover/denom)*usableH) });
 
-  const totalNodesH = nodes.reduce((s,n)=>s+n.h,0) + (nodes.length-1)*10;
-  let cursorY = pad + (usableH - totalNodesH)/2;
+  const totalNodesH = nodes.reduce((s,n)=>s+n.h,0) + (nodes.length-1)*gap;
+  let cursorY = pad + Math.max(0, (usableH - totalNodesH)/2);
 
   let colorI = 0;
   const ribbons = [];
@@ -1732,7 +1751,7 @@ function sankeySvg(income, categories, leftover){
   let incomeCursor = incomeY;
 
   for(const n of nodes){
-    const color = n.leftover ? '#808080' : n.savings ? '#008000' : FLOW_PALETTE[(colorI++) % FLOW_PALETTE.length];
+    const color = n.leftover ? '#808080' : n.other ? '#a0a0a0' : n.savings ? '#008000' : FLOW_PALETTE[(colorI++) % FLOW_PALETTE.length];
     const y0 = cursorY, y1 = cursorY + n.h;
     const srcY0 = incomeCursor, srcY1 = incomeCursor + n.h;
     incomeCursor += n.h;
@@ -1743,25 +1762,47 @@ function sankeySvg(income, categories, leftover){
       fill="${color}" opacity="0.4" stroke="${color}" stroke-width="0.5"/>`);
 
     nodeRects.push(`<rect x="${rightX}" y="${y0}" width="${nodeW}" height="${n.h}" fill="${color}" stroke="#000" stroke-width="1"/>`);
-    labels.push(`<text x="${rightX+nodeW+10}" y="${(y0+y1)/2+4}" fill="#000000" font-size="12" font-family="Tahoma">${escapeHtml(n.name)}</text>
-      <text x="${rightX+nodeW+10}" y="${(y0+y1)/2+19}" fill="#3a3a3a" font-size="11" font-family='Consolas'>${fmtMoney(n.amount)}</text>`);
-    cursorY += n.h + 10;
+    // one line per node (name — amount) so short nodes never collide with their neighbor's label
+    labels.push(`<text x="${rightX+nodeW+10}" y="${(y0+y1)/2+4.5}" fill="#000000" font-size="13" font-family="Tahoma"><tspan font-weight="700">${escapeHtml(n.name)}</tspan><tspan fill="#3a3a3a" font-family="Consolas" font-size="11.5"> — ${fmtMoney(n.amount)}</tspan></text>`);
+    cursorY += n.h + gap;
   }
 
-  return `<svg viewBox="0 0 ${W+150} ${H}" style="width:100%;min-width:640px;height:auto;background:#d4d0c8;">
+  return `<svg viewBox="0 0 ${W+220} ${H}" preserveAspectRatio="none" style="width:100%;height:100%;display:block;background:#d4d0c8;">
     ${ribbons.join('')}
     <rect x="${leftX}" y="${incomeY}" width="${nodeW}" height="${incomeH}" fill="#000080" stroke="#000" stroke-width="1"/>
-    <text x="${leftX-8}" y="${incomeY-10}" fill="#000000" font-size="12.5" font-weight="700" font-family="Tahoma">Income</text>
-    <text x="${leftX-8}" y="${incomeY+incomeH+18}" fill="#3a3a3a" font-size="11" font-family="Consolas">${fmtMoney(income)}</text>
+    <text x="${leftX-8}" y="${incomeY-10}" fill="#000000" font-size="13" font-weight="700" font-family="Tahoma">Income</text>
+    <text x="${leftX-8}" y="${incomeY+incomeH+18}" fill="#3a3a3a" font-size="11.5" font-family="Consolas">${fmtMoney(income)}</text>
     ${nodeRects.join('')}
     ${labels.join('')}
   </svg>`;
 }
 
+// Measures exactly how much vertical room is left below the page's topbar
+// and above the stats-grid row, and sizes the sankey wrap to fill precisely
+// that — no more, no less — so the whole Yearly Flow page fits in whatever
+// window/screen it's viewed on, without needing to scroll.
+function sizeSankeyToFit(){
+  if(route.view !== 'flow') return;
+  const main = document.querySelector('.main');
+  const wrap = document.getElementById('sankey-fit-wrap');
+  const statsGrid = document.getElementById('flow-stats-grid');
+  if(!main || !wrap) return;
+  const mainRect = main.getBoundingClientRect();
+  const wrapTop = wrap.getBoundingClientRect().top;
+  const mainStyle = getComputedStyle(main);
+  const mainPaddingBottom = parseFloat(mainStyle.paddingBottom) || 0;
+  const statsGridSpace = statsGrid ? statsGrid.offsetHeight + 16 : 0; // +16 = its own margin-top
+  const visibleBottom = mainRect.top + main.clientHeight;
+  const available = visibleBottom - wrapTop - mainPaddingBottom - statsGridSpace;
+  wrap.style.height = Math.max(220, available) + 'px';
+}
+
 AFTER_RENDER_HOOKS.flow = function(){
   const sel = document.getElementById('flow-year-select');
   if(sel) sel.onchange = ()=>{ flowYear = Number(sel.value); render(); };
+  sizeSankeyToFit();
 };
+window.addEventListener('resize', sizeSankeyToFit);
 /* =========================================================
    Part 10: Settings
    ========================================================= */
