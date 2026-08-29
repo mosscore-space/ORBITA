@@ -27,6 +27,7 @@ function defaultState(){
       exchangeRates: { USD: 15.42, EUR: null },
       monthlyBudget: 0,
       incomeCodes: ['salary','bonus'],
+      salaryCutoffDay: 28, // salary posted on/after this day of the month counts toward NEXT month
     },
     tagGroups: [
       { id: uid('tg'), name:'Shop', savings:false, entries:[] },
@@ -182,6 +183,18 @@ function fmtDate(iso){
   return d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'numeric'});
 }
 function monthKey(iso){ return (iso||'').slice(0,7); }
+function attributedMonthKey(iso){
+  // Salary posted on/after settings.salaryCutoffDay belongs to next month
+  // (e.g. paid on the 28th of Aug = September's salary).
+  const mk = monthKey(iso);
+  if(!mk) return mk;
+  const day = Number((iso||'').slice(8,10));
+  const cutoff = state.settings.salaryCutoffDay || 28;
+  if(!day || day < cutoff) return mk;
+  const [y,m] = mk.split('-').map(Number);
+  const d = new Date(y, m, 1); // JS month index m = the (m+1)th month, i.e. next month
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0');
+}
 function todayIso(){ return new Date().toISOString().slice(0,10); }
 function currentMonthKey(){ return todayIso().slice(0,7); }
 function monthLabel(mk){
@@ -430,8 +443,10 @@ function renderDashboard(){
     for(const tx of liveTx(acc)){
       const tmk = monthKey(tx.date);
       const excluded = isExcludedFromSpending(tx);
+      if(tx.credit && tx.isIncome && attributedMonthKey(tx.date) === mk){
+        salary += convertToMVR(tx.credit, acc.currency) || 0;
+      }
       if(tmk===mk){
-        if(tx.credit && tx.isIncome) salary += convertToMVR(tx.credit, acc.currency) || 0;
         if(tx.debit && !excluded){
           const mvr = convertToMVR(tx.debit, acc.currency) || 0;
           spent += mvr;
@@ -1492,7 +1507,10 @@ const FLOW_PALETTE = ['#000080','#800080','#008080','#808000','#800000','#0000ff
 
 function yearsWithData(){
   const set = new Set();
-  for(const acc of state.accounts) for(const tx of liveTx(acc)) set.add(Number(tx.date.slice(0,4)));
+  for(const acc of state.accounts) for(const tx of liveTx(acc)){
+    set.add(Number(tx.date.slice(0,4)));
+    if(tx.credit && tx.isIncome) set.add(Number(attributedMonthKey(tx.date).slice(0,4)));
+  }
   set.add(new Date().getFullYear());
   return [...set].sort((a,b)=>b-a);
 }
@@ -1502,9 +1520,11 @@ function computeYearFlow(year){
   let income = 0;
   for(const acc of state.accounts){
     for(const tx of liveTx(acc)){
-      if(Number(tx.date.slice(0,4)) !== year) continue;
-      if(tx.credit && tx.isIncome) income += convertToMVR(tx.credit, acc.currency) || 0;
-      if(tx.debit){
+      if(tx.credit && tx.isIncome){
+        const attributedYear = Number(attributedMonthKey(tx.date).slice(0,4));
+        if(attributedYear === year) income += convertToMVR(tx.credit, acc.currency) || 0;
+      }
+      if(tx.debit && Number(tx.date.slice(0,4)) === year){
         const mvr = convertToMVR(tx.debit, acc.currency) || 0;
         const g = tx.tagGroupId ? state.tagGroups.find(x=>x.id===tx.tagGroupId) : null;
         const key = g ? g.id : '__untagged__';
@@ -1614,6 +1634,10 @@ function renderSettings(){
         <div class="field"><label>Transaction codes counted as income</label>
           <input type="text" id="set-income-codes" value="${escapeHtml(state.settings.incomeCodes.join(', '))}">
           <div class="hint">Comma-separated, e.g. salary, bonus. You can still flag individual transactions on their statement row.</div>
+        </div>
+        <div class="field"><label>Salary posted on/after day of month…</label>
+          <input type="number" min="1" max="31" step="1" id="set-salary-cutoff" value="${state.settings.salaryCutoffDay||28}">
+          <div class="hint">…counts toward next month's salary. E.g. with 28, a salary paid Aug 28 shows as September's income.</div>
         </div>
         <button class="btn primary sm" id="save-settings-btn">Save</button>
       </div>
@@ -1784,6 +1808,7 @@ AFTER_RENDER_HOOKS.settings = function(){
     state.settings.monthlyBudget = parseAmount(document.getElementById('set-budget').value);
     state.settings.exchangeRates.USD = parseAmount(document.getElementById('set-usd-rate').value) || state.settings.exchangeRates.USD;
     state.settings.incomeCodes = document.getElementById('set-income-codes').value.split(',').map(s=>s.trim()).filter(Boolean);
+    state.settings.salaryCutoffDay = Math.min(31, Math.max(1, Math.round(parseAmount(document.getElementById('set-salary-cutoff').value)) || 28));
     scheduleSave(); toast('Settings saved','success'); render();
   };
   document.querySelectorAll('.tag-group-name').forEach(inp=>inp.addEventListener('change',()=>{
