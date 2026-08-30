@@ -332,6 +332,26 @@ function accountLabel(a){
   const suffix = a.accountNumber ? a.accountNumber : a.currency;
   return `${a.name} (${suffix})`;
 }
+// Finds liability payments whose linked transaction doesn't actually exist —
+// the exact inconsistency that would make a payment show as "logged" on the
+// liability page while the target account's own statement never reflects it.
+function diagnoseLiabilityLinks(){
+  const issues = [];
+  for(const l of state.liabilities){
+    for(const p of (l.payments||[])){
+      const acc = getAccount(p.accountId);
+      if(!acc){
+        issues.push({ liabId:l.id, liabName:l.name, payment:p, type:'missing-account' });
+        continue;
+      }
+      const tx = acc.transactions.find(t=>t.id===p.txId);
+      if(!tx){
+        issues.push({ liabId:l.id, liabName:l.name, payment:p, type:'missing-transaction', accId:acc.id, accName:accountLabel(acc) });
+      }
+    }
+  }
+  return issues;
+}
 /* =========================================================
    Part 2: shell — nav, router, modal helpers
    ========================================================= */
@@ -1524,11 +1544,12 @@ function renderLiabilitiesList(){
 function liabilityCardHtml(l){
   const pct = l.principal>0 ? Math.min(100, (l.totalPaid/l.principal)*100) : 0;
   const acc = getAccount(l.repaymentAccountId);
+  const remaining = Math.max(0, l.principal - l.totalPaid);
   return `
     <div class="card liab-card ${l.closed?'faint':''}" data-action="openLiability" data-id="${l.id}" style="cursor:pointer;">
       <div class="acct-name">${escapeHtml(l.name)}</div>
       <div class="acct-meta">${acc?escapeHtml(acc.name):'no account set'} · ${fmtMoney(l.monthlyRepayment)}/mo</div>
-      <div class="acct-balance" style="font-size:20px;margin-top:12px;">${fmtMoney(Math.max(0,l.principal-l.totalPaid))}<span style="font-size:12px;color:var(--text-dim);"> remaining</span></div>
+      <div class="acct-balance" style="font-size:20px;margin-top:12px;${remaining>0?'color:var(--red);':''}">${remaining>0?'−':''}${fmtMoney(remaining)}<span style="font-size:12px;color:var(--text-dim);"> ${remaining>0?'owed':'settled'}</span></div>
       <div class="progress"><div style="width:${pct}%"></div></div>
       <div class="liab-row"><span>${fmtMoney(l.totalPaid)} paid</span><span>${fmtMoney(l.principal)} total</span></div>
       ${l.closed?`<div style="margin-top:10px;"><span class="badge green">Paid off</span> ${l.interestPaid>0?`<span class="badge amber">${fmtMoney(l.interestPaid)} interest</span>`:''}</div>`:''}
@@ -1589,7 +1610,7 @@ function renderLiabilityDetail(id){
         </div>
       </div>
       <div style="display:flex;gap:32px;flex-wrap:wrap;margin-top:18px;">
-        <div><div class="stat-label">Remaining</div><div class="acct-balance">${fmtMoney(remaining)}</div></div>
+        <div><div class="stat-label">Remaining</div><div class="acct-balance" style="${remaining>0?'color:var(--red);':''}">${remaining>0?'−':''}${fmtMoney(remaining)}</div></div>
         <div><div class="stat-label">Paid so far</div><div class="acct-balance" style="font-size:17px;color:var(--text-dim);">${fmtMoney(l.totalPaid)}</div></div>
         <div><div class="stat-label">Original amount</div><div class="acct-balance" style="font-size:17px;color:var(--text-dim);">${fmtMoney(l.principal)}</div></div>
         ${l.closed?`<div><div class="stat-label">Interest paid</div><div class="acct-balance" style="font-size:17px;color:var(--amber);">${fmtMoney(l.interestPaid)}</div></div>`:''}
@@ -1925,6 +1946,7 @@ function renderSettings(){
     </div>
 
     ${githubSettingsCardHtml()}
+    ${dataCheckCardHtml()}
 
     <div class="card" style="margin-bottom:16px;">
       <div class="section-head">
@@ -2204,6 +2226,49 @@ ACTIONS.resetAllConfirm = ()=>{
   confirmDialog('Reset everything?','This deletes all accounts, transactions, liabilities and tags. This cannot be undone — export a backup first if you want one.',()=>{
     state = defaultState(); scheduleSave(); go('dashboard'); toast('Orbita has been reset','success');
   }, 'Reset everything', true);
+};
+
+function dataCheckCardHtml(){
+  const issues = diagnoseLiabilityLinks();
+  if(!issues.length) return `
+    <div class="card" style="margin-bottom:16px;">
+      <div class="section-title" style="margin-bottom:8px;">Data check</div>
+      <div class="hint" style="margin:0;">✓ Every logged liability payment correctly links to a real transaction. No repairs needed.</div>
+    </div>
+  `;
+  return `
+    <div class="card" style="margin-bottom:16px;">
+      <div class="section-title" style="margin-bottom:8px;">Data check</div>
+      <div class="hint" style="margin-bottom:12px;">Found ${issues.length} liability payment${issues.length>1?'s':''} whose linked transaction doesn't actually exist in the account — which is exactly why a logged payment can show up on the liability page but never reduce the account balance. Fixing this creates the missing transaction now.</div>
+      ${issues.map((iss,idx)=>`
+        <div class="settings-item" style="margin-bottom:8px;">
+          <div>
+            <div style="font-size:13px;">${escapeHtml(iss.liabName)} — ${fmtMoney(iss.payment.amount)} on ${fmtDate(iss.payment.date)}</div>
+            <div class="faint" style="font-size:11px;">${iss.type==='missing-account' ? 'linked account no longer exists' : 'missing from '+escapeHtml(iss.accName)}</div>
+          </div>
+          <button class="btn sm" data-action="repairLiabilityPayment" data-idx="${idx}">Fix now</button>
+        </div>`).join('')}
+    </div>
+  `;
+}
+ACTIONS.repairLiabilityPayment = (t)=>{
+  const issues = diagnoseLiabilityLinks();
+  const iss = issues[Number(t.dataset.idx)];
+  if(!iss) return;
+  const l = state.liabilities.find(x=>x.id===iss.liabId);
+  const acc = getAccount(iss.payment.accountId);
+  if(!acc){ toast('That account no longer exists — edit the liability to pick a different one first', 'error'); return; }
+  const tx = {
+    id: uid('tx'), date: iss.payment.date, code:'Loan Payment', uniqueId:null,
+    description: `${l.name} repayment`, altDescription:'', descriptionOverride:null,
+    debit: iss.payment.amount, credit:0, balance:null,
+    tagGroupId:null, tagEntryId:null, envelopeId:null,
+    source:'manual', matched:false, isIncome:false, _seq: Date.now(),
+  };
+  acc.transactions.push(tx);
+  iss.payment.txId = tx.id;
+  scheduleSave(); render();
+  toast(`Fixed — ${fmtMoney(iss.payment.amount)} now debited from ${acc.name}`, 'success');
 };
 /* =========================================================
    Part 11: Win98 window chrome
