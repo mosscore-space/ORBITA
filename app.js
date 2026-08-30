@@ -431,12 +431,11 @@ var AFTER_RENDER_HOOKS = {};
 var dashboardMonth = currentMonthKey();
 
 function collectUnmatched(){
+  // Liabilities don't have their own statement to reconcile against — a
+  // logged payment creates a real transaction in the actual account, and
+  // that transaction's own reconciliation (via the account's statement
+  // import) is what shows up here. No liability-specific tracking needed.
   const items = [];
-  for(const l of state.liabilities){
-    for(const p of (l.payments||[])){
-      if(!p.matched) items.push({ type:'liability payment', label:`${l.name} — ${fmtMoney(p.amount)} on ${fmtDate(p.date)}`, liabId:l.id });
-    }
-  }
   for(const a of state.accounts){
     for(const tx of liveTx(a)){
       if(tx.source==='manual' && !tx.matched){
@@ -645,7 +644,7 @@ function showUnmatchedModal(){
           <div style="font-size:13px;">${escapeHtml(it.label)}</div>
           <div class="faint" style="font-size:11px;text-transform:uppercase;">${it.type}</div>
         </div>
-        <button class="btn sm" data-action="${it.liabId?'openLiability':'openAccount'}" data-id="${it.liabId||it.accId}">Open</button>
+        <button class="btn sm" data-action="openAccount" data-id="${it.accId}">Open</button>
       </div>`).join('') : `<div class="faint">All caught up — nothing to reconcile.</div>`}
   `, {wide:true});
 }
@@ -658,7 +657,6 @@ ACTIONS.dashNextMonth = ()=>{ if(dashboardMonth<maxDashboardMonth()){ dashboardM
 // month's dashboard needs to be viewable before the calendar actually turns over.
 function maxDashboardMonth(){ return monthDelta(currentMonthKey(), 1); }
 ACTIONS.showUnmatched = showUnmatchedModal;
-ACTIONS.openLiability = (t)=>{ closeModal(); go('liabilities',{id:t.dataset.id}); };
 ACTIONS.openAccount = (t)=>{ closeModal(); go('accounts',{id:t.dataset.id}); };
 /* =========================================================
    Part 4: Accounts — list view + create/edit modals
@@ -1558,15 +1556,19 @@ function renderLiabilityDetail(id){
     <div class="card">
       <div class="section-title" style="margin-bottom:12px;">Payment history</div>
       ${payments.length ? `<div class="table-wrap"><table>
-        <thead><tr><th>Date</th><th>Amount</th><th>Account</th><th>Status</th><th></th></tr></thead>
-        <tbody>${payments.map(p=>`
+        <thead><tr><th>Date</th><th>Amount</th><th>Account</th><th>Statement status</th></tr></thead>
+        <tbody>${payments.map(p=>{
+          const pAcc = getAccount(p.accountId);
+          const ptx = pAcc ? pAcc.transactions.find(t=>t.id===p.txId) : null;
+          const reconciled = !!(ptx && ptx.matched);
+          return `
           <tr>
             <td>${fmtDate(p.date)}</td>
             <td class="amt debit">−${fmtMoney(p.amount)}</td>
-            <td>${escapeHtml(getAccount(p.accountId)?.name||'—')}</td>
-            <td>${p.matched?'<span class="badge green">matched</span>':'<span class="badge amber">pending</span>'}</td>
-            <td>${!p.matched?`<button class="btn ghost sm" data-action="linkPayment" data-id="${l.id}" data-p="${p.id}">Link…</button>`:''}</td>
-          </tr>`).join('')}</tbody>
+            <td>${escapeHtml(pAcc?.name||'—')}</td>
+            <td>${reconciled?'<span class="badge green">reconciled</span>':'<span class="badge amber">awaiting statement</span>'}</td>
+          </tr>`;
+        }).join('')}</tbody>
       </table></div>` : `<div class="empty"><div class="t">No payments logged yet</div></div>`}
     </div>
   `;
@@ -1588,6 +1590,7 @@ function openLogPaymentModal(liabId){
       <div class="field"><label>Paid from</label>
         <select name="accountId">${state.accounts.filter(a=>!a.closed).map(a=>`<option value="${a.id}" ${a.id===l.repaymentAccountId?'selected':''}>${escapeHtml(a.name)}</option>`).join('')}</select>
       </div>
+      <div class="hint" style="margin-bottom:12px;">This debits the amount from that account right away. When you later import its statement, the real transaction will link up to this one automatically — same as any other manual entry.</div>
       <div class="modal-actions">
         <button type="button" class="btn ghost" data-action="closeModal">Cancel</button>
         <button type="submit" class="btn primary">Log payment</button>
@@ -1599,36 +1602,29 @@ function openLogPaymentModal(liabId){
     const f = new FormData(e.target);
     const date = f.get('date'), amount = parseAmount(f.get('amount')), accountId = f.get('accountId');
     const acc = getAccount(accountId);
-    const linkedTxIds = new Set(l.payments.filter(p=>p.txId).map(p=>p.txId));
-    const match = acc.transactions.find(t => !linkedTxIds.has(t.id) && t.debit>0 &&
-      Math.abs(t.debit-amount)<0.005 && daysBetween(t.date,date)<=5);
-    const payment = { id: uid('pay'), date, amount, accountId, txId: match?match.id:null, matched: !!match };
-    l.payments.push(payment);
-    l.totalPaid += amount;
-    if(l.totalPaid > l.principal) l.interestPaid = l.totalPaid - l.principal;
-    scheduleSave(); closeModal(); render();
-    toast(match?'Payment logged and matched to your statement':'Payment logged — not yet matched to a statement row','success');
-  };
-}
+    if(!acc || amount<=0) return;
 
-function openLinkPaymentModal(liabId, payId){
-  const l = state.liabilities.find(x=>x.id===liabId); const p = l.payments.find(x=>x.id===payId);
-  const acc = getAccount(p.accountId);
-  const linkedTxIds = new Set(l.payments.filter(pp=>pp.txId && pp.id!==p.id).map(pp=>pp.txId));
-  const candidates = liveTx(acc).filter(t=> !linkedTxIds.has(t.id) && t.debit>0 && daysBetween(t.date,p.date)<=10)
-    .sort((a,b)=>Math.abs(a.debit-p.amount)-Math.abs(b.debit-p.amount)).slice(0,8);
-  openModal(`
-    <div class="modal-head"><div class="modal-title">Link payment to a statement row</div><span class="x-close" data-action="closeModal">✕</span></div>
-    <div class="faint" style="font-size:12px;margin-bottom:12px;">Looking near ${fmtDate(p.date)} for ${fmtMoney(p.amount)}. Amounts can differ slightly due to holds or exchange rates.</div>
-    ${candidates.length ? candidates.map(t=>`
-      <div class="settings-item" style="margin-bottom:7px;">
-        <div><div style="font-size:13px;">${escapeHtml(txDisplayDescription(t))}</div><div class="faint" style="font-size:11px;">${fmtDate(t.date)}</div></div>
-        <div style="display:flex;align-items:center;gap:10px;">
-          <span class="num" style="font-size:13px;">${fmtMoney(t.debit)}</span>
-          <button class="btn sm" data-action="doLinkPayment" data-liab="${liabId}" data-p="${payId}" data-tx="${t.id}">Link</button>
-        </div>
-      </div>`).join('') : `<div class="faint">No close matches found in that account yet — try importing the statement first.</div>`}
-  `, {wide:true});
+    const doLog = ()=>{
+      const tx = {
+        id: uid('tx'), date, code:'Loan Payment', uniqueId:null,
+        description: `${l.name} repayment`, altDescription:'', descriptionOverride:null,
+        debit: amount, credit:0, balance:null,
+        tagGroupId:null, tagEntryId:null, envelopeId:null,
+        source:'manual', matched:false, isIncome:false, _seq: Date.now(),
+      };
+      acc.transactions.push(tx);
+      l.payments.push({ id: uid('pay'), date, amount, accountId, txId: tx.id });
+      l.totalPaid += amount;
+      if(l.totalPaid > l.principal) l.interestPaid = l.totalPaid - l.principal;
+      scheduleSave(); closeModal(); render();
+      toast(`Payment logged — ${fmtMoney(amount)} debited from ${acc.name}`, 'success');
+    };
+
+    const dup = findPossibleDuplicate(acc, date, amount, true);
+    if(dup){
+      confirmDialog('Possible duplicate', `There's already a debit of ${fmtMoney(amount)} around ${fmtDate(date)} in ${escapeHtml(acc.name)} (${escapeHtml(txDisplayDescription(dup))}). Log this payment anyway?`, doLog, 'Log anyway');
+    } else doLog();
+  };
 }
 
 function closeLiability(id){
@@ -1643,12 +1639,6 @@ ACTIONS.newLiability = openNewLiabilityModal;
 ACTIONS.openLiability = (t)=> go('liabilities',{id:t.dataset.id});
 ACTIONS.backToLiabilities = ()=> go('liabilities');
 ACTIONS.logPayment = (t)=> openLogPaymentModal(t.dataset.id);
-ACTIONS.linkPayment = (t)=> openLinkPaymentModal(t.dataset.id, t.dataset.p);
-ACTIONS.doLinkPayment = (t)=>{
-  const l = state.liabilities.find(x=>x.id===t.dataset.liab); const p = l.payments.find(x=>x.id===t.dataset.p);
-  p.txId = t.dataset.tx; p.matched = true;
-  scheduleSave(); closeModal(); render(); toast('Linked','success');
-};
 ACTIONS.closeLiabilityConfirm = (t)=>{
   const id = t.dataset.id;
   confirmDialog('Close this liability?','If you have paid more than the original amount, the difference will be recorded as interest paid.',()=>closeLiability(id),'Close out');
