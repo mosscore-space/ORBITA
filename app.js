@@ -324,6 +324,14 @@ function netWorthMVR(){
     return s + (conv==null?0:conv);
   },0);
 }
+// Disambiguates accounts that share the same name (a real risk once you have
+// several accounts — two named "salary account" are otherwise indistinguishable
+// in any dropdown or label). Always append something that differs.
+function accountLabel(a){
+  if(!a) return '—';
+  const suffix = a.accountNumber ? a.accountNumber : a.currency;
+  return `${a.name} (${suffix})`;
+}
 /* =========================================================
    Part 2: shell — nav, router, modal helpers
    ========================================================= */
@@ -763,13 +771,21 @@ function openNewAccountModal(){
       envelopes: [],
       transactions: [],
     };
-    if(acc.isMain) state.accounts.forEach(a=>a.isMain=false);
-    if(acc.isSalary) state.accounts.forEach(a=>a.isSalary=false);
-    state.accounts.push(acc);
-    scheduleSave();
-    closeModal();
-    toast('Account created','success');
-    go('accounts', {id:acc.id});
+    const createIt = ()=>{
+      if(acc.isMain) state.accounts.forEach(a=>a.isMain=false);
+      if(acc.isSalary) state.accounts.forEach(a=>a.isSalary=false);
+      state.accounts.push(acc);
+      scheduleSave();
+      closeModal();
+      toast('Account created','success');
+      go('accounts', {id:acc.id});
+    };
+    // Two accounts with the same name are otherwise impossible to tell apart
+    // anywhere they're picked from a list — confirm before allowing it.
+    const dupName = state.accounts.find(a=>!a.closed && a.name.trim().toLowerCase()===acc.name.toLowerCase());
+    if(dupName){
+      confirmDialog('Same name as an existing account', `You already have an account named <b>${escapeHtml(dupName.name)}</b>${dupName.accountNumber?' ('+escapeHtml(dupName.accountNumber)+')':''}. Two accounts with the same name look identical in dropdowns and payment history — consider giving this one a distinct name or account number. Create it anyway?`, createIt, 'Create anyway');
+    } else createIt();
   };
 }
 
@@ -1129,7 +1145,7 @@ function openUsdConversionModal(accId){
         <div class="field"><label>USD credited</label><input type="number" step="0.01" name="usdAmount" value="${cfg.usdAmount}" required></div>
       </div>
       <div class="field"><label>Which dollar account?</label>
-        <select name="destAccountId">${usdAccounts.map(x=>`<option value="${x.id}">${escapeHtml(x.name)}</option>`).join('')}</select>
+        <select name="destAccountId">${usdAccounts.map(x=>`<option value="${x.id}">${escapeHtml(accountLabel(x))}</option>`).join('')}</select>
       </div>
       <div class="hint" style="margin-bottom:12px;">Records this as an internal transfer, not spending or income — matches your bank's monthly "STAFF USD" standing order, so it'll link up automatically next time you import that statement.</div>
       <div class="modal-actions">
@@ -1509,7 +1525,7 @@ function openNewLiabilityModal(){
         <div class="field"><label>Monthly repayment</label><input type="number" step="0.01" name="monthlyRepayment" required></div>
       </div>
       <div class="field"><label>Repayment account</label>
-        <select name="repaymentAccountId">${state.accounts.filter(a=>!a.closed).map(a=>`<option value="${a.id}">${escapeHtml(a.name)}</option>`).join('')}</select>
+        <select name="repaymentAccountId">${state.accounts.filter(a=>!a.closed).map(a=>`<option value="${a.id}">${escapeHtml(accountLabel(a))}</option>`).join('')}</select>
       </div>
       <div class="modal-actions">
         <button type="button" class="btn ghost" data-action="closeModal">Cancel</button>
@@ -1543,7 +1559,7 @@ function renderLiabilityDetail(id){
       <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:14px;">
         <div>
           <div class="acct-name" style="font-size:19px;">${escapeHtml(l.name)}</div>
-          <div class="acct-meta">Repaid from ${acc?escapeHtml(acc.name):'—'} · ${fmtMoney(l.monthlyRepayment)} / month</div>
+          <div class="acct-meta">Repaid from ${acc?escapeHtml(accountLabel(acc)):'—'} · ${fmtMoney(l.monthlyRepayment)} / month</div>
         </div>
         <div style="display:flex;gap:8px;">
           ${!l.closed?`<button class="btn primary sm" data-action="logPayment" data-id="${l.id}">+ Log payment</button>`:''}
@@ -1571,7 +1587,7 @@ function renderLiabilityDetail(id){
           <tr>
             <td>${fmtDate(p.date)}</td>
             <td class="amt debit">−${fmtMoney(p.amount)}</td>
-            <td>${escapeHtml(pAcc?.name||'—')}</td>
+            <td>${escapeHtml(pAcc?accountLabel(pAcc):'—')}</td>
             <td>${reconciled?'<span class="badge green">reconciled</span>':'<span class="badge amber">awaiting statement</span>'}</td>
           </tr>`;
         }).join('')}</tbody>
@@ -1594,7 +1610,7 @@ function openLogPaymentModal(liabId){
         <div class="field"><label>Amount</label><input type="number" step="0.01" name="amount" value="${l.monthlyRepayment}" required></div>
       </div>
       <div class="field"><label>Paid from</label>
-        <select name="accountId">${state.accounts.filter(a=>!a.closed).map(a=>`<option value="${a.id}" ${a.id===l.repaymentAccountId?'selected':''}>${escapeHtml(a.name)}</option>`).join('')}</select>
+        <select name="accountId">${state.accounts.filter(a=>!a.closed).map(a=>`<option value="${a.id}" ${a.id===l.repaymentAccountId?'selected':''}>${escapeHtml(accountLabel(a))}</option>`).join('')}</select>
       </div>
       <div class="hint" style="margin-bottom:12px;">This debits the amount from that account right away. When you later import its statement, the real transaction will link up to this one automatically — same as any other manual entry.</div>
       <div class="modal-actions">
