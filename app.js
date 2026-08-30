@@ -493,6 +493,7 @@ function renderDashboard(){
 
   const netWorth = netWorthMVR();
   const eurAccounts = state.accounts.filter(a=>!a.closed && a.currency==='EUR');
+  const salaryAcc = state.accounts.find(a=>a.isSalary && !a.closed);
 
   const topPlaces = Object.entries(placeMap).sort((a,b)=>b[1]-a[1]).slice(0,6);
   const topPurposes = Object.entries(purposeMap).sort((a,b)=>b[1]-a[1]).slice(0,6);
@@ -513,7 +514,12 @@ function renderDashboard(){
       <button class="btn sm" data-action="showUnmatched">Review</button>
     </div>` : ''}
 
-    <div class="grid grid-4" style="margin-bottom:18px;">
+    <div class="grid grid-5" style="margin-bottom:18px;">
+      <div class="card stat-card">
+        <div class="stat-label">Salary account balance</div>
+        <div class="stat-value">${salaryAcc?fmtMoney(accountTotal(salaryAcc)):'—'}<small>${salaryAcc?salaryAcc.currency:''}</small></div>
+        <div class="stat-foot">${salaryAcc?escapeHtml(salaryAcc.name):'set a salary account in Accounts'}</div>
+      </div>
       <div class="card stat-card">
         <div class="stat-label">Salary received</div>
         <div class="stat-value">${fmtMoney(salary)}<small>MVR</small></div>

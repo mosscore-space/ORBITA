@@ -290,10 +290,12 @@ body.login-page{ overflow:hidden; }
   font-size:11px;font-weight:700;color:var(--text);text-transform:none;
 }
 .grid{display:grid;gap:10px;}
+.grid-5{grid-template-columns:repeat(5,1fr);}
 .grid-4{grid-template-columns:repeat(4,1fr);}
 .grid-3{grid-template-columns:repeat(3,1fr);}
 .grid-2{grid-template-columns:repeat(2,1fr);}
-@media(max-width:980px){.grid-4{grid-template-columns:repeat(2,1fr);}.grid-3{grid-template-columns:repeat(2,1fr);}}
+@media(max-width:1180px){.grid-5{grid-template-columns:repeat(3,1fr);}}
+@media(max-width:980px){.grid-5,.grid-4{grid-template-columns:repeat(2,1fr);}.grid-3{grid-template-columns:repeat(2,1fr);}}
 
 .stat-card{position:relative;}
 .stat-label{font-size:11px;color:var(--text-dim);font-weight:700;text-transform:uppercase;}
@@ -514,7 +516,7 @@ td.amt.debit{color:var(--red);}
   .navitem{padding:6px 10px 7px;font-size:11.5px;}
   .navitem svg{display:none;}
   .main{padding:12px;}
-  .grid-4,.grid-3,.grid-2{grid-template-columns:1fr;}
+  .grid-5,.grid-4,.grid-3,.grid-2{grid-template-columns:1fr;}
   .statusbar{flex-wrap:wrap;}
   .sb-field.grow{flex:1 1 100%;}
 }
