@@ -671,18 +671,39 @@ ACTIONS.dashNextMonth = ()=>{ if(dashboardMonth<maxDashboardMonth()){ dashboardM
 // month's dashboard needs to be viewable before the calendar actually turns over.
 function maxDashboardMonth(){ return monthDelta(currentMonthKey(), 1); }
 ACTIONS.showUnmatched = showUnmatchedModal;
-ACTIONS.openAccount = (t)=>{ closeModal(); go('accounts',{id:t.dataset.id}); };
 /* =========================================================
    Part 4: Accounts — list view + create/edit modals
    ========================================================= */
 var showClosedAccounts = false;
 
+function findDuplicateAccountNames(){
+  // Checks ALL accounts (including sinking/closed) — a duplicate could be
+  // hiding anywhere and would look completely identical everywhere unless
+  // surfaced explicitly like this.
+  const groups = {};
+  for(const a of state.accounts){
+    const key = a.name.trim().toLowerCase();
+    (groups[key] = groups[key] || []).push(a);
+  }
+  return Object.values(groups).filter(g => g.length > 1);
+}
+
 function renderAccountsList(){
   const visible = state.accounts.filter(a=>!a.isSinking && (!a.closed || showClosedAccounts));
   const cards = visible.map(a => accountCardHtml(a)).join('');
   const closedCount = state.accounts.filter(a=>!a.isSinking && a.closed).length;
+  const dupGroups = findDuplicateAccountNames();
 
   const body = `
+    ${dupGroups.length ? `<div class="banner" style="align-items:flex-start;">
+      <div>
+        ⚠️ You have ${dupGroups.length>1?'multiple sets of ':''}accounts sharing the same name — they look identical everywhere (dropdowns, liability payments, etc.) except for the account number shown below. This is a common cause of a payment landing in the "wrong" one.
+        ${dupGroups.map(g => `<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          <b>"${escapeHtml(g[0].name)}"</b> — ${g.length} accounts:
+          ${g.map(a=>`<button class="btn sm" data-action="openAccount" data-id="${a.id}">${escapeHtml(accountLabel(a))}${a.closed?' · closed':''}${a.isSinking?' · sinking':''}</button>`).join('')}
+        </div>`).join('')}
+      </div>
+    </div>` : ''}
     ${visible.length ? `<div class="grid grid-3">${cards}</div>` : `
       <div class="empty">
         <div class="t">No accounts yet</div>
@@ -839,7 +860,7 @@ function openEditAccountModal(id){
 }
 
 ACTIONS.newAccount = openNewAccountModal;
-ACTIONS.openAccount = (t)=> go('accounts', {id:t.dataset.id});
+ACTIONS.openAccount = (t)=>{ closeModal(); go('accounts', {id:t.dataset.id}); };
 ACTIONS.editAccount = (t)=> openEditAccountModal(t.dataset.id);
 ACTIONS.toggleClosedAccounts = ()=>{ showClosedAccounts = !showClosedAccounts; render(); };
 ACTIONS.closeAccountConfirm = (t)=>{
@@ -1563,6 +1584,7 @@ function renderLiabilityDetail(id){
         </div>
         <div style="display:flex;gap:8px;">
           ${!l.closed?`<button class="btn primary sm" data-action="logPayment" data-id="${l.id}">+ Log payment</button>`:''}
+          ${!l.closed?`<button class="btn ghost sm" data-action="editLiability" data-id="${l.id}">Edit</button>`:''}
           ${!l.closed?`<button class="btn ghost sm" data-action="closeLiabilityConfirm" data-id="${l.id}">Close out</button>`:''}
         </div>
       </div>
@@ -1657,10 +1679,43 @@ function closeLiability(id){
   toast('Liability closed out — nicely done','success');
 }
 
+function openEditLiabilityModal(id){
+  const l = state.liabilities.find(x=>x.id===id);
+  openModal(`
+    <div class="modal-head"><div class="modal-title">Edit liability</div><span class="x-close" data-action="closeModal">✕</span></div>
+    <form id="edit-liab-form">
+      <div class="field"><label>Name</label><input type="text" name="name" value="${escapeHtml(l.name)}" required></div>
+      <div class="row">
+        <div class="field"><label>Total amount owed</label><input type="number" step="0.01" name="principal" value="${l.principal}" required></div>
+        <div class="field"><label>Monthly repayment</label><input type="number" step="0.01" name="monthlyRepayment" value="${l.monthlyRepayment}" required></div>
+      </div>
+      <div class="field"><label>Repayment account</label>
+        <select name="repaymentAccountId">${state.accounts.filter(a=>!a.closed).map(a=>`<option value="${a.id}" ${a.id===l.repaymentAccountId?'selected':''}>${escapeHtml(accountLabel(a))}</option>`).join('')}</select>
+        <div class="hint">This only changes where future logged payments go — it doesn't move any payments you've already logged.</div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" data-action="closeModal">Cancel</button>
+        <button type="submit" class="btn primary">Save changes</button>
+      </div>
+    </form>
+  `);
+  document.getElementById('edit-liab-form').onsubmit = (e)=>{
+    e.preventDefault();
+    const f = new FormData(e.target);
+    l.name = f.get('name').trim();
+    l.principal = parseAmount(f.get('principal'));
+    l.monthlyRepayment = parseAmount(f.get('monthlyRepayment'));
+    l.repaymentAccountId = f.get('repaymentAccountId');
+    scheduleSave(); closeModal(); render();
+    toast('Liability updated','success');
+  };
+}
+
 ACTIONS.newLiability = openNewLiabilityModal;
 ACTIONS.openLiability = (t)=> go('liabilities',{id:t.dataset.id});
 ACTIONS.backToLiabilities = ()=> go('liabilities');
 ACTIONS.logPayment = (t)=> openLogPaymentModal(t.dataset.id);
+ACTIONS.editLiability = (t)=> openEditLiabilityModal(t.dataset.id);
 ACTIONS.closeLiabilityConfirm = (t)=>{
   const id = t.dataset.id;
   confirmDialog('Close this liability?','If you have paid more than the original amount, the difference will be recorded as interest paid.',()=>closeLiability(id),'Close out');
