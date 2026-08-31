@@ -466,8 +466,9 @@ td.amt.debit{color:var(--red);}
 .liab-row{display:flex;justify-content:space-between;font-size:11px;color:var(--text-dim);margin-top:6px;}
 
 /* ---------- Sankey ---------- */
-.sankey-wrap{overflow:hidden;display:flex;}
-.sankey-wrap svg{flex:1;min-width:0;}
+.sankey-wrap{overflow:auto;} /* auto, not hidden — zooming in needs to scroll, and content is always sized to fit at zoom=1 anyway */
+#sankey-zoom-wrap{display:flex;}
+#sankey-zoom-wrap svg{flex:1;min-width:0;}
 .sankey-legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:12px;}
 .sankey-legend .li{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--text-dim);}
 .sankey-legend .sw{width:9px;height:9px;}

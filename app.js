@@ -1825,6 +1825,7 @@ ACTIONS.closeLiabilityConfirm = (t)=>{
    Part 9: Yearly Flow (Sankey)
    ========================================================= */
 var flowYear = new Date().getFullYear();
+var flowZoom = 1;
 const FLOW_PALETTE = ['#000080','#800080','#008080','#808000','#800000','#0000ff','#ff00ff','#808080'];
 
 function yearsWithData(){
@@ -1878,7 +1879,7 @@ function renderFlow(){
     <div style="font-size:12.5px;">Mark some credit transactions as income, and tag your spending, to see the year come together here.</div></div>
   ` : `
     <div class="card sankey-wrap" id="sankey-fit-wrap">
-      ${sankeySvg(income, categories, leftover)}
+      <div id="sankey-zoom-wrap">${sankeySvg(income, categories, leftover)}</div>
     </div>
     <div class="grid grid-3" id="flow-stats-grid" style="margin-top:16px;">
       <div class="card card-tight"><div class="stat-label">Income</div><div class="stat-value" style="font-size:19px;">${fmtMoney(income)}</div></div>
@@ -1888,28 +1889,37 @@ function renderFlow(){
   `;
 
   return renderPage('Yearly Flow', 'Where a year of income actually went.', `
+    <button class="btn icon ghost sm" data-action="flowZoomOut" title="Zoom out">−</button>
+    <button class="btn ghost sm" data-action="flowZoomReset" title="Reset to fit the screen">Reset view</button>
+    <button class="btn icon ghost sm" data-action="flowZoomIn" title="Zoom in">+</button>
     <select id="flow-year-select" style="width:auto;">${yearsWithData().map(y=>`<option value="${y}" ${y===flowYear?'selected':''}>${y}</option>`).join('')}</select>
   `, body);
 }
 
 function sankeySvg(income, categories, leftover){
-  // Fixed internal coordinate system — the wrapping div is sized to the
-  // actual viewport by sizeSankeyToFit(), and preserveAspectRatio="none"
-  // lets this stretch to fill it exactly, both directions, no scrolling.
-  const W = 900, H = 480, pad = 20;
+  // The canvas height is DERIVED from actual content, never fixed — a fixed
+  // height meant nodes forced to their readable minimum (many small
+  // categories) could push the real total past the canvas and get silently
+  // clipped off the bottom. Sizing it to content first means nothing is ever
+  // cut off; sizeSankeyToFit() + zoom then scale the WHOLE thing uniformly
+  // to fit (or exceed, when zoomed) the available screen space.
+  const W = 900, pad = 20;
   const nodeW = 18;
   const minNodeH = 26; // enough room for one legible label line, never overlaps a neighbor
   const gap = 14;
+  const refH = 400; // fixed dollars-per-pixel reference scale for proportional sizing
   const leftX = pad, rightX = W - pad - nodeW;
   const denom = Math.max(income, categories.reduce((s,c)=>s+c.amount,0), 1);
-  const usableH = H - pad*2;
-  const incomeH = Math.max(minNodeH, (income/denom) * usableH);
+
+  let nodes = categories.map(c => ({ ...c, h: Math.max(minNodeH, (c.amount/denom)*refH) }));
+  if(leftover > 0.01) nodes.push({ name:'Left over', amount:leftover, savings:false, leftover:true, h: Math.max(minNodeH,(leftover/denom)*refH) });
+
+  const totalNodesH = nodes.reduce((s,n)=>s+n.h,0) + Math.max(0,nodes.length-1)*gap;
+  const usableH = Math.max(totalNodesH, refH); // canvas grows to fit content; only ever the floor, never a ceiling
+  const H = usableH + pad*2;
+
+  const incomeH = Math.max(minNodeH, (income/denom) * refH);
   const incomeY = pad + (usableH - incomeH)/2;
-
-  let nodes = categories.map(c => ({ ...c, h: Math.max(minNodeH, (c.amount/denom)*usableH) }));
-  if(leftover > 0.01) nodes.push({ name:'Left over', amount:leftover, savings:false, leftover:true, h: Math.max(minNodeH,(leftover/denom)*usableH) });
-
-  const totalNodesH = nodes.reduce((s,n)=>s+n.h,0) + (nodes.length-1)*gap;
   let cursorY = pad + Math.max(0, (usableH - totalNodesH)/2);
 
   let colorI = 0;
@@ -1935,7 +1945,10 @@ function sankeySvg(income, categories, leftover){
     cursorY += n.h + gap;
   }
 
-  return `<svg viewBox="0 0 ${W+220} ${H}" preserveAspectRatio="none" style="width:100%;height:100%;display:block;background:#d4d0c8;">
+  // preserveAspectRatio="xMidYMid meet" scales the WHOLE diagram down (or up,
+  // when zoomed) uniformly to fit whatever box it's given — never distorts,
+  // never clips, since the viewBox above already exactly matches the content.
+  return `<svg viewBox="0 0 ${W+220} ${H}" preserveAspectRatio="xMidYMid meet" style="width:100%;height:100%;display:block;background:#d4d0c8;">
     ${ribbons.join('')}
     <rect x="${leftX}" y="${incomeY}" width="${nodeW}" height="${incomeH}" fill="#000080" stroke="#000" stroke-width="1"/>
     <text x="${leftX-8}" y="${incomeY-10}" fill="#000000" font-size="13" font-weight="700" font-family="Tahoma">Income</text>
@@ -1946,28 +1959,38 @@ function sankeySvg(income, categories, leftover){
 }
 
 // Measures exactly how much vertical room is left below the page's topbar
-// and above the stats-grid row, and sizes the sankey wrap to fill precisely
-// that — no more, no less — so the whole Yearly Flow page fits in whatever
-// window/screen it's viewed on, without needing to scroll.
+// and above the stats-grid row, and sizes the OUTER viewport to fill
+// precisely that — no scrolling at zoom=1. The INNER zoom-wrap is sized to
+// viewport-height × flowZoom; growing it beyond the (scroll-enabled) outer
+// viewport is what makes "zoom in" work — the meet-scaled SVG renders
+// larger to fill the bigger inner box, and you scroll to see the rest.
 function sizeSankeyToFit(){
   if(route.view !== 'flow') return;
   const main = document.querySelector('.main');
   const wrap = document.getElementById('sankey-fit-wrap');
+  const zoomWrap = document.getElementById('sankey-zoom-wrap');
   const statsGrid = document.getElementById('flow-stats-grid');
-  if(!main || !wrap) return;
+  if(!main || !wrap || !zoomWrap) return;
   const mainRect = main.getBoundingClientRect();
   const wrapTop = wrap.getBoundingClientRect().top;
   const mainStyle = getComputedStyle(main);
   const mainPaddingBottom = parseFloat(mainStyle.paddingBottom) || 0;
   const statsGridSpace = statsGrid ? statsGrid.offsetHeight + 16 : 0; // +16 = its own margin-top
   const visibleBottom = mainRect.top + main.clientHeight;
-  const available = visibleBottom - wrapTop - mainPaddingBottom - statsGridSpace;
-  wrap.style.height = Math.max(220, available) + 'px';
+  const available = visibleBottom - wrapTop - mainPaddingBottom;
+  const viewportH = Math.max(220, available - statsGridSpace);
+  wrap.style.height = viewportH + 'px';
+  zoomWrap.style.width = (100 * flowZoom) + '%';
+  zoomWrap.style.height = (viewportH * flowZoom) + 'px';
 }
+
+ACTIONS.flowZoomIn = ()=>{ flowZoom = Math.min(3, Math.round((flowZoom + 0.25) * 100) / 100); sizeSankeyToFit(); };
+ACTIONS.flowZoomOut = ()=>{ flowZoom = Math.max(1, Math.round((flowZoom - 0.25) * 100) / 100); sizeSankeyToFit(); };
+ACTIONS.flowZoomReset = ()=>{ flowZoom = 1; sizeSankeyToFit(); };
 
 AFTER_RENDER_HOOKS.flow = function(){
   const sel = document.getElementById('flow-year-select');
-  if(sel) sel.onchange = ()=>{ flowYear = Number(sel.value); render(); };
+  if(sel) sel.onchange = ()=>{ flowYear = Number(sel.value); flowZoom = 1; render(); };
   sizeSankeyToFit();
 };
 window.addEventListener('resize', sizeSankeyToFit);
