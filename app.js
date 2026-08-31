@@ -31,9 +31,9 @@ function defaultState(){
       usdConversion: { mvrAmount: 3084, usdAmount: 200 }, // default amounts for the monthly MVR→USD conversion
     },
     tagGroups: [
-      { id: uid('tg'), name:'Shop', savings:false, subcategories:[] },
-      { id: uid('tg'), name:'Subscription', savings:false, subcategories:[] },
-      { id: uid('tg'), name:'Internal Transfer', savings:false, excludeFromSpending:true, subcategories:[] },
+      { id: uid('tg'), name:'Shop', savings:false, places:[], purposes:[] },
+      { id: uid('tg'), name:'Subscription', savings:false, places:[], purposes:[] },
+      { id: uid('tg'), name:'Internal Transfer', savings:false, excludeFromSpending:true, places:[], purposes:[] },
     ],
     accounts: [],
     liabilities: [],
@@ -58,14 +58,43 @@ function mergeIntoState(parsed){
   }
   delete state.settings.salaryCutoffDay;
   if(!state.tagGroups || !state.tagGroups.length) state.tagGroups = defaultState().tagGroups;
-  // migrate old 2-level tag groups (flat entries) into the new 3-level shape
-  // (group -> subcategory -> entry), wrapping each old entry in its own
-  // subcategory of the same name so existing tagEntryId references on
-  // transactions keep resolving correctly (entry ids are preserved).
+  // migrate tag groups into the current shape: independent Places and Purposes
+  // lists per group, selected together on a transaction (placeId + purposeId),
+  // rather than one nested inside the other.
   state.tagGroups.forEach(g => {
-    if(!g.subcategories){
-      g.subcategories = (g.entries || []).map(e => ({ id: uid('tsc'), name: e.name, entries: [e] }));
+    if(g.places || g.purposes) return; // already current shape
+    g.places = [];
+    g.purposes = [];
+    const entryToPurpose = {}; // old entry id -> new purpose id, for migrating transactions below
+    if(g.subcategories){
+      // one level up: group -> subcategory -> entry (each entry was BOTH a
+      // place and implicitly scoped to one purpose = its subcategory's name)
+      const purposeByName = {};
+      for(const sub of g.subcategories){
+        const key = sub.name.trim().toLowerCase();
+        if(!purposeByName[key]) purposeByName[key] = { id: uid('purp'), name: sub.name };
+        for(const e of (sub.entries||[])){
+          g.places.push({ id: e.id, name: e.name, matches: e.matches||[] }); // keep the id — transactions reference it
+          entryToPurpose[e.id] = purposeByName[key].id;
+        }
+      }
+      g.purposes = Object.values(purposeByName);
+      delete g.subcategories;
+    } else if(g.entries){
+      // oldest shape: group -> entry directly (no purpose distinction existed yet)
+      for(const e of g.entries) g.places.push({ id: e.id, name: e.name, matches: e.matches||[] });
       delete g.entries;
+    }
+    // carry every transaction's old tagEntryId (now a placeId) forward, and
+    // attach whichever purpose that entry used to imply, if any
+    for(const acc of (state.accounts||[])){
+      for(const tx of (acc.transactions||[])){
+        if(tx.tagGroupId === g.id && tx.tagEntryId){
+          tx.placeId = tx.tagEntryId;
+          tx.purposeId = entryToPurpose[tx.tagEntryId] || null;
+          delete tx.tagEntryId;
+        }
+      }
     }
   });
 }
@@ -277,14 +306,13 @@ function envelopeSum(acc){
 function unassignedBalance(acc){
   return accountTotal(acc) - envelopeSum(acc);
 }
-function tagLookup(tagGroupId, tagEntryId){
+function tagLookup(tagGroupId, placeId, purposeId){
   const g = state.tagGroups.find(g=>g.id===tagGroupId);
   if(!g) return null;
-  for(const sub of (g.subcategories||[])){
-    const e = (sub.entries||[]).find(e=>e.id===tagEntryId);
-    if(e) return { group:g, subcategory:sub, entry:e };
-  }
-  return null;
+  const place = placeId ? (g.places||[]).find(p=>p.id===placeId) : null;
+  const purpose = purposeId ? (g.purposes||[]).find(p=>p.id===purposeId) : null;
+  if(!place && !purpose) return null;
+  return { group:g, place, purpose };
 }
 function txDisplayDescription(tx){
   return tx.descriptionOverride || tx.description || tx.altDescription || tx.code || '(no description)';
@@ -293,11 +321,9 @@ function autoTagForDescription(desc){
   if(!desc) return null;
   const up = desc.toUpperCase();
   for(const g of state.tagGroups){
-    for(const sub of (g.subcategories||[])){
-      for(const e of (sub.entries||[])){
-        for(const kw of (e.matches||[])){
-          if(kw && up.includes(kw.toUpperCase())) return { tagGroupId:g.id, tagEntryId:e.id };
-        }
+    for(const p of (g.places||[])){
+      for(const kw of (p.matches||[])){
+        if(kw && up.includes(kw.toUpperCase())) return { tagGroupId:g.id, placeId:p.id };
       }
     }
   }
@@ -502,8 +528,8 @@ function renderDashboard(){
           spent += mvr;
           const place = txDisplayDescription(tx);
           placeMap[place] = (placeMap[place]||0) + mvr;
-          const lk = tagLookup(tx.tagGroupId, tx.tagEntryId);
-          const purpose = lk ? lk.subcategory.name : 'Untagged';
+          const lk = tagLookup(tx.tagGroupId, tx.placeId, tx.purposeId);
+          const purpose = lk && lk.purpose ? lk.purpose.name : 'Untagged';
           purposeMap[purpose] = (purposeMap[purpose]||0) + mvr;
         }
       }
@@ -992,7 +1018,8 @@ function filteredTransactions(a){
 }
 
 function transactionRowHtml(a, tx){
-  const lk = tagLookup(tx.tagGroupId, tx.tagEntryId);
+  const lk = tagLookup(tx.tagGroupId, tx.placeId, tx.purposeId);
+  const tagLabel = lk ? [lk.place?.name, lk.purpose?.name].filter(Boolean).join(' · ') : '';
   const env = (a.envelopes||[]).find(e=>e.id===tx.envelopeId);
   return `
     <tr>
@@ -1004,7 +1031,7 @@ function transactionRowHtml(a, tx){
       <td><span class="badge">${escapeHtml(tx.code||'—')}</span></td>
       <td>
         <span class="tagchip ${lk?'':'empty'}" data-action="tagTx" data-id="${a.id}" data-tx="${tx.id}">
-          ${lk?`<span class="swatch"></span>${escapeHtml(lk.entry.name)}`:'+ tag'}
+          ${lk?`<span class="swatch"></span>${escapeHtml(tagLabel)}`:'+ tag'}
         </span>
       </td>
       <td>
@@ -1155,21 +1182,16 @@ function renderInPlaceStatement(){ render(); }
 function findOrCreateInternalTransferEntry(name, matches){
   let group = state.tagGroups.find(g => g.name === 'Internal Transfer');
   if(!group){
-    group = { id: uid('tg'), name:'Internal Transfer', savings:false, excludeFromSpending:true, subcategories:[] };
+    group = { id: uid('tg'), name:'Internal Transfer', savings:false, excludeFromSpending:true, places:[], purposes:[] };
     state.tagGroups.push(group);
   }
-  group.subcategories = group.subcategories || [];
-  let sub = group.subcategories.find(s => s.name === name);
-  if(!sub){
-    sub = { id: uid('tsc'), name, entries:[] };
-    group.subcategories.push(sub);
+  group.places = group.places || [];
+  let place = group.places.find(p => p.name === name);
+  if(!place){
+    place = { id: uid('te'), name, matches: matches.slice() };
+    group.places.push(place);
   }
-  let entry = sub.entries.find(e => e.name === name);
-  if(!entry){
-    entry = { id: uid('te'), name, matches: matches.slice() };
-    sub.entries.push(entry);
-  }
-  return { group, subcategory: sub, entry };
+  return { group, place };
 }
 
 function openUsdConversionModal(accId){
@@ -1206,19 +1228,19 @@ function openUsdConversionModal(accId){
 
     const doRealize = ()=>{
       const transferGroupId = uid('xfer');
-      const { group, entry } = findOrCreateInternalTransferEntry('USD Conversion', ['STAFF USD']);
+      const { group, place } = findOrCreateInternalTransferEntry('USD Conversion', ['STAFF USD']);
       a.transactions.push({
         id: uid('tx'), date, code:'Standing Order', uniqueId:null,
         description:'STAFF USD', altDescription:'', descriptionOverride:null,
         debit: mvrAmount, credit:0, balance:null,
-        tagGroupId: group.id, tagEntryId: entry.id, envelopeId:null,
+        tagGroupId: group.id, placeId: place.id, purposeId: null, envelopeId:null,
         source:'manual', matched:false, isIncome:false, transferGroupId, _seq: Date.now(),
       });
       dest.transactions.push({
         id: uid('tx'), date, code:'Standing Order', uniqueId:null,
         description:'Salary USD conversion', altDescription:'', descriptionOverride:null,
         debit:0, credit: usdAmount, balance:null,
-        tagGroupId: group.id, tagEntryId: entry.id, envelopeId:null,
+        tagGroupId: group.id, placeId: place.id, purposeId: null, envelopeId:null,
         source:'manual', matched:false, isIncome:false, transferGroupId, _seq: Date.now()+1,
       });
       state.settings.usdConversion = { mvrAmount, usdAmount };
@@ -1292,7 +1314,7 @@ function openNewTxModal(accId){
         id: uid('tx'), date, code: f.get('code').trim()||'Manual',
         uniqueId:null, description: desc, altDescription:'', descriptionOverride:null,
         debit: dir==='debit'?amount:0, credit: dir==='credit'?amount:0,
-        balance:null, tagGroupId: auto?auto.tagGroupId:null, tagEntryId: auto?auto.tagEntryId:null,
+        balance:null, tagGroupId: auto?auto.tagGroupId:null, placeId: auto?auto.placeId:null, purposeId: null,
         envelopeId: f.get('envelopeId')||null, source:'manual', matched:false,
         isIncome: dir==='credit' && isIncomeCode(f.get('code').trim()||'Manual'), _seq: Date.now(),
       };
@@ -1307,90 +1329,148 @@ function openNewTxModal(accId){
   };
 }
 
-/* ---------------- tagging ---------------- */
-var tagModalState = { accId:null, txId:null, expandedGroup:null, expandedSub:null };
+/* ---------------- tagging: independent Place + Purpose selection ---------------- */
+var tagModalState = { accId:null, txId:null, expandedGroup:null, placeSearch:'', purposeSearch:'', pendingPlaceId:null, pendingPurposeId:null, remember:true };
 
 function openTagModal(accId, txId){
-  tagModalState = { accId, txId, expandedGroup:null, expandedSub:null };
+  const a = getAccount(accId); const tx = a.transactions.find(x=>x.id===txId);
+  tagModalState = {
+    accId, txId,
+    expandedGroup: tx.tagGroupId || null,
+    placeSearch:'', purposeSearch:'',
+    pendingPlaceId: tx.placeId || null,
+    pendingPurposeId: tx.purposeId || null,
+    remember: true,
+  };
   renderTagModal();
 }
 
 function renderTagModal(){
-  const { accId, txId } = tagModalState;
+  const { accId, txId, expandedGroup, placeSearch, purposeSearch, pendingPlaceId, pendingPurposeId } = tagModalState;
   const a = getAccount(accId); const tx = a.transactions.find(x=>x.id===txId);
-  openModal(`
-    <div class="modal-head"><div class="modal-title">Tag transaction</div><span class="x-close" data-action="closeModal">✕</span></div>
-    <div class="faint" style="font-size:12px;margin-bottom:14px;">${escapeHtml(txDisplayDescription(tx))}</div>
-    <div id="tag-tree-wrap">${renderTagTreeHtml()}</div>
-    <div class="hint" style="margin-top:10px;">Manage tags, subcategories, and places in Settings.</div>
-    ${tx.tagGroupId ? `<div class="modal-actions" style="justify-content:flex-start;"><button class="btn ghost sm" data-action="clearTag" data-id="${accId}" data-tx="${txId}">Remove current tag</button></div>` : ''}
-  `, {wide:true});
-}
+  const desc = (tx.description || tx.altDescription || '').trim();
+  const descUp = desc.toUpperCase();
 
-function renderTagTreeHtml(){
-  const { accId, txId, expandedGroup, expandedSub } = tagModalState;
-  return `<div class="tag-tree">${state.tagGroups.map(g=>{
-    const groupOpen = expandedGroup === g.id;
-    const subs = g.subcategories || [];
+  const groupsHtml = state.tagGroups.map(g=>{
+    const open = expandedGroup === g.id;
     return `
       <div class="tag-tree-row lvl1" data-action="toggleTagGroupExpand" data-group="${g.id}">
-        <span class="tag-tree-arrow">${groupOpen?'▾':'▸'}</span>
+        <span class="tag-tree-arrow">${open?'▾':'▸'}</span>
         <span style="flex:1;">${escapeHtml(g.name)}</span>
         ${g.savings?'<span class="badge green">savings</span>':''}
       </div>
-      ${groupOpen ? (subs.length ? subs.map(sub=>{
-        const subOpen = expandedSub === sub.id;
-        const entries = sub.entries || [];
-        return `
-          <div class="tag-tree-row lvl2" data-action="toggleTagSubExpand" data-sub="${sub.id}">
-            <span class="tag-tree-arrow">${subOpen?'▾':'▸'}</span>
-            <span style="flex:1;">${escapeHtml(sub.name)}</span>
-          </div>
-          ${subOpen ? (entries.length ? entries.map(e=>`
-            <div class="tag-tree-row lvl3" data-action="pickTagEntry" data-id="${accId}" data-tx="${txId}" data-group="${g.id}" data-entry="${e.id}">
-              <span class="swatch"></span>${escapeHtml(e.name)}
-            </div>`).join('') : `<div class="tag-tree-row lvl3 faint">No places here yet — add one in Settings.</div>`) : ''}
-        `;
-      }).join('') : `<div class="tag-tree-row lvl2 faint">No subcategories yet — add one in Settings.</div>`) : ''}
+      ${open ? renderPlacePurposePickers(g) : ''}
     `;
-  }).join('')}</div>`;
-}
+  }).join('');
 
-function maybeLearnAndAssign(accId, txId, groupId, entryId){
-  const a = getAccount(accId); const tx = a.transactions.find(x=>x.id===txId);
-  const lk = tagLookup(groupId, entryId);
-  if(!lk) return;
-  const desc = (tx.description || tx.altDescription || '').trim();
-  const descUp = desc.toUpperCase();
-  const already = desc && lk.entry.matches.some(m => descUp.includes(m.toUpperCase()) || m.toUpperCase().includes(descUp));
-  const assign = ()=>{ tx.tagGroupId=groupId; tx.tagEntryId=entryId; scheduleSave(); closeModal(); render(); };
-  if(desc && !already){
-    confirmDialog('Make this permanent?', `Always tag future transactions from <b>${escapeHtml(desc)}</b> as <b>${escapeHtml(lk.entry.name)}</b>?`, ()=>{
-      lk.entry.matches.push(descUp); assign();
-    }, 'Yes, always');
-    // also allow "just this once" — wire cancel to assign without learning
-    setTimeout(()=>{
-      const cancelBtn = document.querySelector('.modal-actions .btn.ghost');
-      if(cancelBtn) cancelBtn.onclick = assign;
-    }, 0);
-  } else assign();
+  function renderPlacePurposePickers(g){
+    const places = (g.places||[]).filter(p=>!placeSearch || p.name.toLowerCase().includes(placeSearch.toLowerCase()));
+    const purposes = (g.purposes||[]).filter(p=>!purposeSearch || p.name.toLowerCase().includes(purposeSearch.toLowerCase()));
+    const selectedPlace = pendingPlaceId ? (g.places||[]).find(p=>p.id===pendingPlaceId) : null;
+    const showRemember = selectedPlace && desc && !selectedPlace.matches.some(m=>descUp.includes(m.toUpperCase())||m.toUpperCase().includes(descUp));
+    return `
+      <div class="tag-picker-cols">
+        <div class="tag-picker-col">
+          <div class="tag-picker-label">Place ${(g.places||[]).length ? `<span class="faint">(${(g.places||[]).length})</span>` : ''}</div>
+          <input type="text" class="tag-search-input" id="place-search-input" placeholder="Search places…" value="${escapeHtml(placeSearch)}">
+          <div class="tag-picker-list">
+            ${places.length ? places.map(p=>`
+              <div class="tag-tree-row lvl3 ${p.id===pendingPlaceId?'selected':''}" data-action="pickPlace" data-group="${g.id}" data-place="${p.id}">
+                <span class="swatch"></span>${escapeHtml(p.name)}
+              </div>`).join('') : `<div class="tag-tree-row lvl3 faint">${(g.places||[]).length?'No match.':'No places yet — add some in Settings.'}</div>`}
+          </div>
+        </div>
+        <div class="tag-picker-col">
+          <div class="tag-picker-label">Purpose ${(g.purposes||[]).length ? `<span class="faint">(${(g.purposes||[]).length})</span>` : ''}</div>
+          <input type="text" class="tag-search-input" id="purpose-search-input" placeholder="Search purposes…" value="${escapeHtml(purposeSearch)}">
+          <div class="tag-picker-list">
+            ${purposes.length ? purposes.map(p=>`
+              <div class="tag-tree-row lvl3 ${p.id===pendingPurposeId?'selected':''}" data-action="pickPurpose" data-group="${g.id}" data-purpose="${p.id}">
+                ${escapeHtml(p.name)}
+              </div>`).join('') : `<div class="tag-tree-row lvl3 faint">${(g.purposes||[]).length?'No match.':'No purposes yet — add some in Settings.'}</div>`}
+          </div>
+        </div>
+      </div>
+      ${showRemember ? `<label class="checkline" style="margin-top:10px;"><input type="checkbox" id="remember-place-cb" ${tagModalState.remember?'checked':''}> Always tag "${escapeHtml(desc)}" as ${escapeHtml(selectedPlace.name)}</label>` : ''}
+      <div class="modal-actions">
+        <button type="button" class="btn ghost sm" data-action="closeModal">Cancel</button>
+        <button type="button" class="btn primary sm" data-action="applyTagSelection">Apply</button>
+      </div>
+    `;
+  }
+
+  openModal(`
+    <div class="modal-head"><div class="modal-title">Tag transaction</div><span class="x-close" data-action="closeModal">✕</span></div>
+    <div class="faint" style="font-size:12px;margin-bottom:14px;">${escapeHtml(txDisplayDescription(tx))}</div>
+    <div id="tag-tree-wrap"><div class="tag-tree">${groupsHtml}</div></div>
+    <div class="hint" style="margin-top:10px;">Manage places and purposes in Settings.</div>
+    ${tx.tagGroupId ? `<div class="modal-actions" style="justify-content:flex-start;"><button class="btn ghost sm" data-action="clearTag" data-id="${accId}" data-tx="${txId}">Remove current tag</button></div>` : ''}
+  `, {wide:true});
+
+  // re-focus + restore cursor position on whichever search box was just typed in
+  const focusId = tagModalState._focusId;
+  if(focusId){
+    const el = document.getElementById(focusId);
+    if(el){ el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+  }
+  const placeSearchEl = document.getElementById('place-search-input');
+  if(placeSearchEl) placeSearchEl.oninput = ()=>{ tagModalState.placeSearch = placeSearchEl.value; tagModalState._focusId = 'place-search-input'; renderTagModal(); };
+  const purposeSearchEl = document.getElementById('purpose-search-input');
+  if(purposeSearchEl) purposeSearchEl.oninput = ()=>{ tagModalState.purposeSearch = purposeSearchEl.value; tagModalState._focusId = 'purpose-search-input'; renderTagModal(); };
+  const rememberCbEl = document.getElementById('remember-place-cb');
+  if(rememberCbEl) rememberCbEl.onchange = ()=>{ tagModalState.remember = rememberCbEl.checked; };
 }
 
 ACTIONS.newTx = (t)=> openNewTxModal(t.dataset.id);
 ACTIONS.tagTx = (t)=> openTagModal(t.dataset.id, t.dataset.tx);
 ACTIONS.toggleTagGroupExpand = (t)=>{
   const gid = t.dataset.group;
-  tagModalState.expandedGroup = (tagModalState.expandedGroup === gid) ? null : gid;
-  tagModalState.expandedSub = null;
+  const wasSameGroup = tagModalState.expandedGroup === gid;
+  tagModalState.expandedGroup = wasSameGroup ? null : gid;
+  if(!wasSameGroup){
+    // switching to a different group starts a fresh selection under it
+    const a = getAccount(tagModalState.accId); const tx = a.transactions.find(x=>x.id===tagModalState.txId);
+    const alreadyThisGroup = tx.tagGroupId === gid;
+    tagModalState.pendingPlaceId = alreadyThisGroup ? tx.placeId||null : null;
+    tagModalState.pendingPurposeId = alreadyThisGroup ? tx.purposeId||null : null;
+  }
+  tagModalState.placeSearch = ''; tagModalState.purposeSearch = ''; tagModalState._focusId = null;
   renderTagModal();
 };
-ACTIONS.toggleTagSubExpand = (t)=>{
-  const sid = t.dataset.sub;
-  tagModalState.expandedSub = (tagModalState.expandedSub === sid) ? null : sid;
+ACTIONS.pickPlace = (t)=>{
+  const pid = t.dataset.place;
+  tagModalState.pendingPlaceId = (tagModalState.pendingPlaceId===pid) ? null : pid;
+  tagModalState._focusId = null;
   renderTagModal();
 };
-ACTIONS.pickTagEntry = (t)=> maybeLearnAndAssign(t.dataset.id, t.dataset.tx, t.dataset.group, t.dataset.entry);
-ACTIONS.clearTag = (t)=>{ const a=getAccount(t.dataset.id); const tx=a.transactions.find(x=>x.id===t.dataset.tx); tx.tagGroupId=null; tx.tagEntryId=null; scheduleSave(); closeModal(); render(); };
+ACTIONS.pickPurpose = (t)=>{
+  const pid = t.dataset.purpose;
+  tagModalState.pendingPurposeId = (tagModalState.pendingPurposeId===pid) ? null : pid;
+  tagModalState._focusId = null;
+  renderTagModal();
+};
+ACTIONS.applyTagSelection = ()=>{
+  const { accId, txId, expandedGroup, pendingPlaceId, pendingPurposeId } = tagModalState;
+  const a = getAccount(accId); const tx = a.transactions.find(x=>x.id===txId);
+  const rememberCb = document.getElementById('remember-place-cb');
+  if(pendingPlaceId && rememberCb && rememberCb.checked){
+    const g = state.tagGroups.find(x=>x.id===expandedGroup);
+    const place = g.places.find(p=>p.id===pendingPlaceId);
+    const desc = (tx.description || tx.altDescription || '').trim();
+    if(desc) place.matches.push(desc.toUpperCase());
+  }
+  if(pendingPlaceId || pendingPurposeId){
+    tx.tagGroupId = expandedGroup; tx.placeId = pendingPlaceId; tx.purposeId = pendingPurposeId;
+  } else {
+    tx.tagGroupId = null; tx.placeId = null; tx.purposeId = null;
+  }
+  scheduleSave(); closeModal(); render();
+};
+ACTIONS.clearTag = (t)=>{
+  const a=getAccount(t.dataset.id); const tx=a.transactions.find(x=>x.id===t.dataset.tx);
+  tx.tagGroupId=null; tx.placeId=null; tx.purposeId=null;
+  scheduleSave(); closeModal(); render();
+};
 /* =========================================================
    Part 7: CSV statement import
    ========================================================= */
@@ -1498,7 +1578,7 @@ function commitImport(accId, rows){
     if(manualMatch.isIncome===undefined) manualMatch.isIncome = isIncomeCode(row.code);
     if(!manualMatch.tagGroupId){
       const auto = autoTagForDescription(row.description);
-      if(auto){ manualMatch.tagGroupId = auto.tagGroupId; manualMatch.tagEntryId = auto.tagEntryId; }
+      if(auto){ manualMatch.tagGroupId = auto.tagGroupId; manualMatch.placeId = auto.placeId; }
     }
   }
   for(const row of toAdd){
@@ -1507,7 +1587,7 @@ function commitImport(accId, rows){
       id: uid('tx'), date: row.date, code: row.code, uniqueId: row.uniqueId||null,
       description: row.description, altDescription: row.altDescription, descriptionOverride:null,
       debit: row.debit, credit: row.credit, balance: row.balance,
-      tagGroupId: auto?auto.tagGroupId:null, tagEntryId: auto?auto.tagEntryId:null,
+      tagGroupId: auto?auto.tagGroupId:null, placeId: auto?auto.placeId:null, purposeId: null,
       envelopeId:null, source:'import', matched:true, isIncome: isIncomeCode(row.code), _seq: Date.now()+Math.random(),
     });
   }
@@ -1674,7 +1754,7 @@ function openLogPaymentModal(liabId){
         id: uid('tx'), date, code:'Loan Payment', uniqueId:null,
         description: `${l.name} repayment`, altDescription:'', descriptionOverride:null,
         debit: amount, credit:0, balance:null,
-        tagGroupId:null, tagEntryId:null, envelopeId:null,
+        tagGroupId:null, placeId:null, purposeId:null, envelopeId:null,
         source:'manual', matched:false, isIncome:false, _seq: Date.now(),
       };
       acc.transactions.push(tx);
@@ -1982,34 +2062,31 @@ function tagSettingsBlockHtml(g){
         <label class="checkline"><input type="checkbox" class="tag-group-exclude" data-group="${g.id}" ${g.excludeFromSpending?'checked':''}> Exclude from spending</label>
         <span class="x-close" data-action="deleteTagGroup" data-group="${g.id}">✕ delete group</span>
       </div>
-      <div style="margin-top:10px;padding-left:14px;box-shadow:inset 2px 0 0 var(--shadow);">
-        ${(g.subcategories||[]).map(sub=>tagSubcategoryBlockHtml(g, sub)).join('') || '<div class="faint" style="font-size:11.5px;margin-bottom:8px;">No subcategories yet.</div>'}
-        <div class="row">
-          <input type="text" class="new-subcategory-input" data-group="${g.id}" placeholder="+ add a subcategory, e.g. AI Subscription">
-          <button class="btn sm" data-action="addSubcategory" data-group="${g.id}">Add</button>
+      <div class="tag-picker-cols" style="margin-top:10px;">
+        <div class="tag-picker-col">
+          <div class="tag-picker-label">Places <span class="faint">— where you go, however many</span></div>
+          ${(g.places||[]).map(p=>`
+            <div class="tag-entry-row">
+              <input type="text" class="tag-place-name" data-group="${g.id}" data-place="${p.id}" value="${escapeHtml(p.name)}" style="width:130px;flex:none;">
+              <input type="text" class="tag-place-matches" data-group="${g.id}" data-place="${p.id}" value="${escapeHtml((p.matches||[]).join(', '))}" placeholder="match keywords, comma-separated" style="flex:1;">
+              <span class="x-close" data-action="deleteTagPlace" data-group="${g.id}" data-place="${p.id}">✕</span>
+            </div>`).join('') || '<div class="faint" style="font-size:11.5px;margin-bottom:6px;">No places yet.</div>'}
+          <div class="row" style="margin-top:6px;">
+            <input type="text" class="new-tag-place-input" data-group="${g.id}" placeholder="+ add places, comma-separated: Nisal Mart, Keeza Zone, ...">
+            <button class="btn sm" data-action="addTagPlace" data-group="${g.id}">Add</button>
+          </div>
         </div>
-      </div>
-    </div>
-  `;
-}
-
-function tagSubcategoryBlockHtml(g, sub){
-  return `
-    <div class="tag-sub-block">
-      <div style="display:flex;align-items:center;gap:8px;">
-        <input type="text" class="tag-sub-name" data-group="${g.id}" data-sub="${sub.id}" value="${escapeHtml(sub.name)}" style="font-weight:700;flex:1;">
-        <span class="x-close" data-action="deleteSubcategory" data-group="${g.id}" data-sub="${sub.id}">✕</span>
-      </div>
-      <div style="margin-top:8px;padding-left:12px;">
-        ${(sub.entries||[]).map(e=>`
-          <div class="tag-entry-row">
-            <input type="text" class="tag-entry-name" data-group="${g.id}" data-sub="${sub.id}" data-entry="${e.id}" value="${escapeHtml(e.name)}" style="width:140px;flex:none;">
-            <input type="text" class="tag-entry-matches" data-group="${g.id}" data-sub="${sub.id}" data-entry="${e.id}" value="${escapeHtml((e.matches||[]).join(', '))}" placeholder="match keywords, comma-separated" style="flex:1;">
-            <span class="x-close" data-action="deleteTagEntry" data-group="${g.id}" data-sub="${sub.id}" data-entry="${e.id}">✕</span>
-          </div>`).join('')}
-        <div class="row" style="margin-top:6px;">
-          <input type="text" class="new-tag-entry-input" data-group="${g.id}" data-sub="${sub.id}" placeholder="+ add a place, e.g. ChatGPT">
-          <button class="btn sm" data-action="addTagEntrySettings" data-group="${g.id}" data-sub="${sub.id}">Add</button>
+        <div class="tag-picker-col">
+          <div class="tag-picker-label">Purposes <span class="faint">— why, reused across any place</span></div>
+          ${(g.purposes||[]).map(p=>`
+            <div class="tag-entry-row">
+              <input type="text" class="tag-purpose-name" data-group="${g.id}" data-purpose="${p.id}" value="${escapeHtml(p.name)}" style="flex:1;">
+              <span class="x-close" data-action="deleteTagPurpose" data-group="${g.id}" data-purpose="${p.id}">✕</span>
+            </div>`).join('') || '<div class="faint" style="font-size:11.5px;margin-bottom:6px;">No purposes yet.</div>'}
+          <div class="row" style="margin-top:6px;">
+            <input type="text" class="new-tag-purpose-input" data-group="${g.id}" placeholder="+ add purposes, comma-separated: Groceries, Electronics, ...">
+            <button class="btn sm" data-action="addTagPurpose" data-group="${g.id}">Add</button>
+          </div>
         </div>
       </div>
     </div>
@@ -2117,19 +2194,17 @@ AFTER_RENDER_HOOKS.settings = function(){
   document.querySelectorAll('.tag-group-exclude').forEach(inp=>inp.addEventListener('change',()=>{
     const g = state.tagGroups.find(x=>x.id===inp.dataset.group); g.excludeFromSpending = inp.checked; scheduleSave();
   }));
-  document.querySelectorAll('.tag-sub-name').forEach(inp=>inp.addEventListener('change',()=>{
-    const g = state.tagGroups.find(x=>x.id===inp.dataset.group); const sub = g.subcategories.find(x=>x.id===inp.dataset.sub);
-    sub.name = inp.value.trim()||sub.name; scheduleSave();
+  document.querySelectorAll('.tag-place-name').forEach(inp=>inp.addEventListener('change',()=>{
+    const g = state.tagGroups.find(x=>x.id===inp.dataset.group); const p = g.places.find(x=>x.id===inp.dataset.place);
+    p.name = inp.value.trim()||p.name; scheduleSave();
   }));
-  document.querySelectorAll('.tag-entry-name').forEach(inp=>inp.addEventListener('change',()=>{
-    const g = state.tagGroups.find(x=>x.id===inp.dataset.group); const sub = g.subcategories.find(x=>x.id===inp.dataset.sub);
-    const e = sub.entries.find(x=>x.id===inp.dataset.entry);
-    e.name = inp.value.trim()||e.name; scheduleSave();
+  document.querySelectorAll('.tag-place-matches').forEach(inp=>inp.addEventListener('change',()=>{
+    const g = state.tagGroups.find(x=>x.id===inp.dataset.group); const p = g.places.find(x=>x.id===inp.dataset.place);
+    p.matches = inp.value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean); scheduleSave();
   }));
-  document.querySelectorAll('.tag-entry-matches').forEach(inp=>inp.addEventListener('change',()=>{
-    const g = state.tagGroups.find(x=>x.id===inp.dataset.group); const sub = g.subcategories.find(x=>x.id===inp.dataset.sub);
-    const e = sub.entries.find(x=>x.id===inp.dataset.entry);
-    e.matches = inp.value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean); scheduleSave();
+  document.querySelectorAll('.tag-purpose-name').forEach(inp=>inp.addEventListener('change',()=>{
+    const g = state.tagGroups.find(x=>x.id===inp.dataset.group); const p = g.purposes.find(x=>x.id===inp.dataset.purpose);
+    p.name = inp.value.trim()||p.name; scheduleSave();
   }));
   const importFile = document.getElementById('import-data-file');
   if(importFile) importFile.addEventListener('change', handleImportBackup);
@@ -2148,50 +2223,69 @@ ACTIONS.deleteAccountType = (t)=>{
 ACTIONS.addTagGroupSettings = ()=>{
   const inp = document.getElementById('new-tag-group-input'); const v = inp.value.trim();
   if(!v) return;
-  state.tagGroups.push({ id: uid('tg'), name:v, savings:false, subcategories:[] }); scheduleSave(); render();
+  state.tagGroups.push({ id: uid('tg'), name:v, savings:false, places:[], purposes:[] }); scheduleSave(); render();
 };
 ACTIONS.deleteTagGroup = (t)=>{
   const id = t.dataset.group;
-  confirmDialog('Delete this tag group?','Its subcategories and places go with it, and any tagged transactions will become untagged.',()=>{
+  confirmDialog('Delete this tag group?','Its places and purposes go with it, and any tagged transactions will become untagged.',()=>{
     state.tagGroups = state.tagGroups.filter(g=>g.id!==id);
-    state.accounts.forEach(a=>a.transactions.forEach(tx=>{ if(tx.tagGroupId===id){ tx.tagGroupId=null; tx.tagEntryId=null; } }));
+    state.accounts.forEach(a=>a.transactions.forEach(tx=>{ if(tx.tagGroupId===id){ tx.tagGroupId=null; tx.placeId=null; tx.purposeId=null; } }));
     scheduleSave(); render();
   }, 'Delete', true);
 };
-ACTIONS.addSubcategory = (t)=>{
+ACTIONS.addTagPlace = (t)=>{
   const wrap = t.closest('.tag-group-block');
-  const inp = wrap.querySelector('.new-subcategory-input'); const v = inp.value.trim();
-  if(!v) return;
+  const inp = wrap.querySelector('.new-tag-place-input'); const raw = inp.value.trim();
+  if(!raw) return;
   const g = state.tagGroups.find(x=>x.id===t.dataset.group);
-  g.subcategories = g.subcategories || [];
-  g.subcategories.push({ id: uid('tsc'), name:v, entries:[] });
+  g.places = g.places || [];
+  // supports comma-separated bulk add — paste "Nisal Mart, Keeza Zone, SMD Alihava Baazaar"
+  // to add all of them at once; they all draw from the SAME shared list of purposes below
+  const names = raw.split(',').map(s=>s.trim()).filter(Boolean);
+  const existing = new Set(g.places.map(p=>p.name.toLowerCase()));
+  let added = 0;
+  for(const name of names){
+    if(existing.has(name.toLowerCase())) continue;
+    g.places.push({ id: uid('te'), name, matches:[] });
+    existing.add(name.toLowerCase());
+    added++;
+  }
   scheduleSave(); render();
+  if(names.length>1) toast(`Added ${added} place${added!==1?'s':''}${added<names.length?` (${names.length-added} already existed)`:''}`, 'success');
 };
-ACTIONS.deleteSubcategory = (t)=>{
+ACTIONS.deleteTagPlace = (t)=>{
   const g = state.tagGroups.find(x=>x.id===t.dataset.group);
-  confirmDialog('Delete this subcategory?','Its places go with it, and any tagged transactions will become untagged.',()=>{
-    const sub = g.subcategories.find(s=>s.id===t.dataset.sub);
-    const entryIds = new Set((sub && sub.entries || []).map(e=>e.id));
-    g.subcategories = g.subcategories.filter(s=>s.id!==t.dataset.sub);
-    state.accounts.forEach(a=>a.transactions.forEach(tx=>{ if(entryIds.has(tx.tagEntryId)){ tx.tagGroupId=null; tx.tagEntryId=null; } }));
+  confirmDialog('Delete this place?','Any transactions tagged with it will lose that tag (their purpose, if set separately, stays).',()=>{
+    g.places = g.places.filter(p=>p.id!==t.dataset.place);
+    state.accounts.forEach(a=>a.transactions.forEach(tx=>{ if(tx.placeId===t.dataset.place) tx.placeId=null; }));
     scheduleSave(); render();
   }, 'Delete', true);
 };
-ACTIONS.deleteTagEntry = (t)=>{
+ACTIONS.addTagPurpose = (t)=>{
+  const wrap = t.closest('.tag-group-block');
+  const inp = wrap.querySelector('.new-tag-purpose-input'); const raw = inp.value.trim();
+  if(!raw) return;
   const g = state.tagGroups.find(x=>x.id===t.dataset.group);
-  const sub = g.subcategories.find(s=>s.id===t.dataset.sub);
-  sub.entries = sub.entries.filter(e=>e.id!==t.dataset.entry);
-  state.accounts.forEach(a=>a.transactions.forEach(tx=>{ if(tx.tagEntryId===t.dataset.entry){ tx.tagGroupId=null; tx.tagEntryId=null; } }));
+  g.purposes = g.purposes || [];
+  const names = raw.split(',').map(s=>s.trim()).filter(Boolean);
+  const existing = new Set(g.purposes.map(p=>p.name.toLowerCase()));
+  let added = 0;
+  for(const name of names){
+    if(existing.has(name.toLowerCase())) continue;
+    g.purposes.push({ id: uid('purp'), name });
+    existing.add(name.toLowerCase());
+    added++;
+  }
   scheduleSave(); render();
+  if(names.length>1) toast(`Added ${added} purpose${added!==1?'s':''}${added<names.length?` (${names.length-added} already existed)`:''}`, 'success');
 };
-ACTIONS.addTagEntrySettings = (t)=>{
-  const wrap = t.closest('.tag-sub-block');
-  const inp = wrap.querySelector('.new-tag-entry-input'); const v = inp.value.trim();
-  if(!v) return;
+ACTIONS.deleteTagPurpose = (t)=>{
   const g = state.tagGroups.find(x=>x.id===t.dataset.group);
-  const sub = g.subcategories.find(s=>s.id===t.dataset.sub);
-  sub.entries.push({ id: uid('te'), name:v, matches:[] });
-  scheduleSave(); render();
+  confirmDialog('Delete this purpose?','Any transactions tagged with it will lose that tag (their place, if set separately, stays).',()=>{
+    g.purposes = g.purposes.filter(p=>p.id!==t.dataset.purpose);
+    state.accounts.forEach(a=>a.transactions.forEach(tx=>{ if(tx.purposeId===t.dataset.purpose) tx.purposeId=null; }));
+    scheduleSave(); render();
+  }, 'Delete', true);
 };
 ACTIONS.newAccountSinking = ()=>{
   openNewAccountModal();
@@ -2262,7 +2356,7 @@ ACTIONS.repairLiabilityPayment = (t)=>{
     id: uid('tx'), date: iss.payment.date, code:'Loan Payment', uniqueId:null,
     description: `${l.name} repayment`, altDescription:'', descriptionOverride:null,
     debit: iss.payment.amount, credit:0, balance:null,
-    tagGroupId:null, tagEntryId:null, envelopeId:null,
+    tagGroupId:null, placeId:null, purposeId:null, envelopeId:null,
     source:'manual', matched:false, isIncome:false, _seq: Date.now(),
   };
   acc.transactions.push(tx);

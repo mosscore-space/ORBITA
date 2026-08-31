@@ -484,14 +484,23 @@ td.amt.debit{color:var(--red);}
 .tag-entry-row:first-of-type{border-top:none;}
 
 /* ---------- tag picker tree (transaction tagging modal) ---------- */
-.tag-tree{box-shadow:var(--sunken);background:var(--input-bg);max-height:340px;overflow-y:auto;}
+.tag-tree{box-shadow:var(--sunken);background:var(--input-bg);}
 .tag-tree-row{display:flex;align-items:center;gap:8px;padding:7px 10px;cursor:pointer;font-size:12.5px;border-bottom:1px solid #e6e6e6;}
 .tag-tree-row:hover{background:#e8ecff;}
 .tag-tree-row.lvl1{font-weight:700;background:var(--face);}
-.tag-tree-row.lvl2{padding-left:26px;background:var(--face-light);}
-.tag-tree-row.lvl3{padding-left:44px;cursor:pointer;}
+.tag-tree-row.lvl3{padding-left:20px;cursor:pointer;}
+.tag-tree-row.lvl3.selected{background:var(--selected-bg);color:#fff;}
+.tag-tree-row.lvl3.selected .swatch{background:#fff;}
 .tag-tree-row.faint{cursor:default;color:var(--text-faint);}
 .tag-tree-row.faint:hover{background:inherit;}
+
+/* ---------- independent Place / Purpose picker (transaction tag modal + settings) ---------- */
+.tag-picker-cols{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:10px;background:var(--face-light);}
+.tag-picker-col{min-width:0;}
+.tag-picker-label{font-size:11px;font-weight:700;text-transform:uppercase;color:var(--text-dim);margin-bottom:6px;}
+.tag-search-input{margin-bottom:6px;}
+.tag-picker-list{max-height:220px;overflow-y:auto;box-shadow:var(--sunken);background:var(--input-bg);}
+@media(max-width:640px){.tag-picker-cols{grid-template-columns:1fr;}}
 .tag-tree-arrow{width:12px;display:inline-block;font-size:10px;color:var(--text-dim);}
 
 .banner{
