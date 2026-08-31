@@ -1044,7 +1044,10 @@ function transactionRowHtml(a, tx){
         ${tx.credit? '+'+fmtMoney(tx.credit) : '−'+fmtMoney(tx.debit)}
         ${tx.credit ? `<div><span class="badge ${tx.isIncome?'green':''}" style="cursor:pointer;margin-top:4px;" data-action="toggleIncome" data-id="${a.id}" data-tx="${tx.id}">${tx.isIncome?'income':'not income'}</span></div>` : ''}
       </td>
-      <td><span class="x-close" data-action="deleteTx" data-id="${a.id}" data-tx="${tx.id}" title="Remove">✕</span></td>
+      <td>
+        ${!tx.matched?`<span class="x-close" data-action="editTx" data-id="${a.id}" data-tx="${tx.id}" title="Edit" style="margin-right:6px;">✎</span>`:''}
+        <span class="x-close" data-action="deleteTx" data-id="${a.id}" data-tx="${tx.id}" title="Remove">✕</span>
+      </td>
     </tr>
   `;
 }
@@ -1258,8 +1261,9 @@ ACTIONS.openUsdConversion = (t)=> openUsdConversionModal(t.dataset.id);
 /* =========================================================
    Part 6: manual transactions + tagging
    ========================================================= */
-function findPossibleDuplicate(a, date, amount, isDebit){
+function findPossibleDuplicate(a, date, amount, isDebit, excludeId){
   return liveTx(a).find(t=>{
+    if(excludeId && t.id===excludeId) return false;
     if(daysBetween(t.date, date) > 2) return false;
     const amt = isDebit ? t.debit : t.credit;
     return Math.abs((amt||0) - amount) < 0.005 && (isDebit ? t.debit>0 : t.credit>0);
@@ -1328,6 +1332,80 @@ function openNewTxModal(accId){
     } else doAdd();
   };
 }
+
+/* ---------------- editing an unmatched (not-yet-reconciled) manual entry ----------------
+   Once a transaction is matched — reconciled against a real imported statement
+   row — its date/amount/etc. reflect the actual bank record and shouldn't be
+   quietly changed here. Unmatched entries are still just your own record, so
+   they stay fully correctable until that happens. */
+function openEditTxModal(accId, txId){
+  const a = getAccount(accId);
+  const tx = a.transactions.find(x=>x.id===txId);
+  if(!tx || tx.matched){ toast('Only unmatched transactions can be edited this way', 'error'); return; }
+  const isCredit = tx.credit > 0;
+  openModal(`
+    <div class="modal-head"><div class="modal-title">Edit transaction</div><span class="x-close" data-action="closeModal">✕</span></div>
+    <form id="edit-tx-form">
+      <div class="row">
+        <div class="field"><label>Date</label><input type="date" name="date" value="${tx.date}" required></div>
+        <div class="field"><label>Type</label>
+          <div class="segmented" id="edit-tx-dir-seg">
+            <button type="button" class="${!isCredit?'active':''}" data-v="debit">Expense</button>
+            <button type="button" class="${isCredit?'active':''}" data-v="credit">Income</button>
+          </div>
+          <input type="hidden" name="dir" value="${isCredit?'credit':'debit'}">
+        </div>
+      </div>
+      <div class="field"><label>Note (optional)</label><input type="text" name="description" value="${escapeHtml(tx.descriptionOverride || tx.description || '')}" placeholder="What was this for?"></div>
+      <div class="row">
+        <div class="field"><label>Amount (${a.currency})</label><input type="number" step="0.01" name="amount" value="${isCredit?tx.credit:tx.debit}" required></div>
+        <div class="field"><label>Category code (optional)</label><input type="text" name="code" value="${escapeHtml(tx.code||'')}" placeholder="e.g. Purchase"></div>
+      </div>
+      <div class="hint" style="margin-bottom:12px;">Only unmatched, manually-entered transactions can be edited this way — once one matches your real statement, its details are locked in.</div>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" data-action="closeModal">Cancel</button>
+        <button type="submit" class="btn primary">Save changes</button>
+      </div>
+    </form>
+  `);
+  const seg = document.getElementById('edit-tx-dir-seg');
+  seg.querySelectorAll('button').forEach(b=>b.onclick = ()=>{
+    seg.querySelectorAll('button').forEach(x=>x.classList.remove('active'));
+    b.classList.add('active');
+    document.querySelector('#edit-tx-form input[name=dir]').value = b.dataset.v;
+  });
+  document.getElementById('edit-tx-form').onsubmit = (e)=>{
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const dir = f.get('dir');
+    const amount = parseAmount(f.get('amount'));
+    const date = f.get('date');
+    const desc = f.get('description').trim();
+    const code = f.get('code').trim() || 'Manual';
+    const doSave = ()=>{
+      const directionChanged = (dir==='credit') !== (tx.credit>0);
+      tx.date = date;
+      tx.debit = dir==='debit' ? amount : 0;
+      tx.credit = dir==='credit' ? amount : 0;
+      tx.description = desc;
+      tx.descriptionOverride = null;
+      tx.code = code;
+      if(dir==='debit'){
+        tx.isIncome = false;
+      } else if(directionChanged){
+        // just switched from expense to income — infer a sensible default
+        tx.isIncome = isIncomeCode(code);
+      } // else staying a credit: preserve whatever isIncome already was (may have been manually toggled)
+      scheduleSave(); closeModal(); render();
+      toast('Transaction updated','success');
+    };
+    const dup = findPossibleDuplicate(a, date, amount, dir==='debit', tx.id);
+    if(dup){
+      confirmDialog('Possible duplicate', `There is already a transaction of ${fmtMoney(amount)} around ${fmtDate(date)} (${escapeHtml(txDisplayDescription(dup))}). Save this change anyway?`, doSave, 'Save anyway');
+    } else doSave();
+  };
+}
+ACTIONS.editTx = (t)=> openEditTxModal(t.dataset.id, t.dataset.tx);
 
 /* ---------------- tagging: independent Place + Purpose selection ---------------- */
 var tagModalState = { accId:null, txId:null, expandedGroup:null, placeSearch:'', purposeSearch:'', pendingPlaceId:null, pendingPurposeId:null, remember:true };
