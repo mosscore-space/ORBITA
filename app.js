@@ -97,6 +97,15 @@ function mergeIntoState(parsed){
       }
     }
   });
+  // one-time rename: the monthly MVR→USD conversion used to auto-create a
+  // place called "USD Conversion" — rename it in place (same id, so every
+  // transaction already tagged with it updates too) to match the bank's own
+  // name for it.
+  const itGroup = state.tagGroups.find(g => g.name === 'Internal Transfer');
+  if(itGroup && itGroup.places){
+    const oldPlace = itGroup.places.find(p => p.name === 'USD Conversion');
+    if(oldPlace) oldPlace.name = 'BML Staff Dollar Support';
+  }
 }
 function loadLocal(){
   try{
@@ -956,6 +965,8 @@ function renderAccountDetail(id){
         <div style="display:flex;gap:8px;">
           <button class="btn ghost sm" data-action="editAccount" data-id="${a.id}">Edit</button>
           <button class="btn sm" data-action="openImport" data-id="${a.id}">⇩ Import statement</button>
+          ${state.accounts.some(x=>x.id!==a.id && !x.closed) ?
+            `<button class="btn sm" data-action="openTransfer" data-id="${a.id}">⇄ Transfer funds</button>` : ''}
           ${a.currency!=='USD' && state.accounts.some(x=>x.currency==='USD' && x.id!==a.id && !x.closed) ?
             `<button class="btn sm" data-action="openUsdConversion" data-id="${a.id}">💱 Convert to USD</button>` : ''}
           <button class="btn primary sm" data-action="newTx" data-id="${a.id}">+ Add transaction</button>
@@ -1231,7 +1242,7 @@ function openUsdConversionModal(accId){
 
     const doRealize = ()=>{
       const transferGroupId = uid('xfer');
-      const { group, place } = findOrCreateInternalTransferEntry('USD Conversion', ['STAFF USD']);
+      const { group, place } = findOrCreateInternalTransferEntry('BML Staff Dollar Support', ['STAFF USD']);
       a.transactions.push({
         id: uid('tx'), date, code:'Standing Order', uniqueId:null,
         description:'STAFF USD', altDescription:'', descriptionOverride:null,
@@ -1258,6 +1269,93 @@ function openUsdConversionModal(accId){
   };
 }
 ACTIONS.openUsdConversion = (t)=> openUsdConversionModal(t.dataset.id);
+
+/* =========================================================
+   General internal transfer — move funds between any two of your
+   own accounts. Not spending, not income: the money's still yours,
+   just moved (or converted). Tagged "Internal Transfer" so it's
+   excluded from spending totals and the Yearly Flow, same as the
+   USD conversion above — it only shows up there once it's actually
+   spent on something, from wherever it ends up.
+   ========================================================= */
+function openTransferModal(accId){
+  const a = getAccount(accId);
+  const others = state.accounts.filter(x => x.id!==a.id && !x.closed);
+  if(!others.length){ toast('You need at least one other open account to transfer to', 'error'); return; }
+  openModal(`
+    <div class="modal-head"><div class="modal-title">Transfer funds</div><span class="x-close" data-action="closeModal">✕</span></div>
+    <form id="transfer-form">
+      <div class="field"><label>Date</label><input type="date" name="date" value="${todayIso()}" required></div>
+      <div class="row">
+        <div class="field"><label>Amount out of ${escapeHtml(a.name)} (${a.currency})</label><input type="number" step="0.01" name="fromAmount" required></div>
+        <div class="field"><label>To account</label>
+          <select name="toAccountId" id="transfer-to-select">${others.map(x=>`<option value="${x.id}">${escapeHtml(accountLabel(x))}</option>`).join('')}</select>
+        </div>
+      </div>
+      <div class="field"><label>Amount into destination (<span id="transfer-to-currency"></span>)</label><input type="number" step="0.01" name="toAmount" id="transfer-to-amount" required></div>
+      <div class="field"><label>Note (optional)</label><input type="text" name="note" placeholder="e.g. topping up savings"></div>
+      <div class="hint" style="margin-bottom:12px;">Recorded as an internal transfer, not spending or income — this money is still yours, just in a different account.</div>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" data-action="closeModal">Cancel</button>
+        <button type="submit" class="btn primary">Transfer</button>
+      </div>
+    </form>
+  `);
+  const toSelect = document.getElementById('transfer-to-select');
+  const fromAmountInput = document.querySelector('#transfer-form [name=fromAmount]');
+  const toAmountInput = document.getElementById('transfer-to-amount');
+  const toCurrencyLabel = document.getElementById('transfer-to-currency');
+  function syncToAmount(){
+    const dest = getAccount(toSelect.value);
+    toCurrencyLabel.textContent = dest ? dest.currency : '';
+    // same currency on both sides — auto-fill the destination amount, unless the user's already typed their own
+    if(dest && dest.currency === a.currency && !toAmountInput.dataset.userEdited){
+      toAmountInput.value = fromAmountInput.value;
+    }
+  }
+  toSelect.onchange = syncToAmount;
+  fromAmountInput.oninput = syncToAmount;
+  toAmountInput.addEventListener('input', ()=>{ toAmountInput.dataset.userEdited = '1'; });
+  syncToAmount();
+
+  document.getElementById('transfer-form').onsubmit = (e)=>{
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const date = f.get('date');
+    const fromAmount = parseAmount(f.get('fromAmount'));
+    const toAmount = parseAmount(f.get('toAmount'));
+    const dest = getAccount(f.get('toAccountId'));
+    const note = f.get('note').trim();
+    if(!dest || fromAmount<=0 || toAmount<=0) return;
+
+    const doTransfer = ()=>{
+      const transferGroupId = uid('xfer');
+      const { group, place } = findOrCreateInternalTransferEntry('Account Transfer', []);
+      a.transactions.push({
+        id: uid('tx'), date, code:'Transfer', uniqueId:null,
+        description: note || `Transfer to ${dest.name}`, altDescription:'', descriptionOverride:null,
+        debit: fromAmount, credit:0, balance:null,
+        tagGroupId: group.id, placeId: place.id, purposeId:null, envelopeId:null,
+        source:'manual', matched:false, isIncome:false, transferGroupId, _seq: Date.now(),
+      });
+      dest.transactions.push({
+        id: uid('tx'), date, code:'Transfer', uniqueId:null,
+        description: note || `Transfer from ${a.name}`, altDescription:'', descriptionOverride:null,
+        debit:0, credit: toAmount, balance:null,
+        tagGroupId: group.id, placeId: place.id, purposeId:null, envelopeId:null,
+        source:'manual', matched:false, isIncome:false, transferGroupId, _seq: Date.now()+1,
+      });
+      scheduleSave(); closeModal(); render();
+      toast(`Transferred ${fmtMoney(fromAmount)} ${a.currency} → ${fmtMoney(toAmount)} ${dest.currency}`, 'success');
+    };
+
+    const dup = findPossibleDuplicate(a, date, fromAmount, true);
+    if(dup){
+      confirmDialog('Possible duplicate', `There's already a debit of ${fmtMoney(fromAmount)} around ${fmtDate(date)} in ${escapeHtml(a.name)} (${escapeHtml(txDisplayDescription(dup))}). Transfer anyway?`, doTransfer, 'Transfer anyway');
+    } else doTransfer();
+  };
+}
+ACTIONS.openTransfer = (t)=> openTransferModal(t.dataset.id);
 /* =========================================================
    Part 6: manual transactions + tagging
    ========================================================= */
@@ -1920,7 +2018,10 @@ function computeYearFlow(year){
     for(const tx of liveTx(acc)){
       if(Number(attributedMonthKey(tx.date).slice(0,4)) !== year) continue;
       if(tx.credit && tx.isIncome) income += convertToMVR(tx.credit, acc.currency) || 0;
-      if(tx.debit){
+      // internal transfers aren't spending — the money's still yours, just
+      // moved or in a different form. It only shows up here once it's
+      // actually spent on something, from wherever it ends up.
+      if(tx.debit && !isExcludedFromSpending(tx)){
         const mvr = convertToMVR(tx.debit, acc.currency) || 0;
         const g = tx.tagGroupId ? state.tagGroups.find(x=>x.id===tx.tagGroupId) : null;
         const key = g ? g.id : '__untagged__';
