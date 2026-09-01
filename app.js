@@ -98,14 +98,27 @@ function mergeIntoState(parsed){
     }
   });
   // one-time rename: the monthly MVR→USD conversion used to auto-create a
-  // place called "USD Conversion" — rename it in place (same id, so every
-  // transaction already tagged with it updates too) to match the bank's own
-  // name for it.
-  const itGroup = state.tagGroups.find(g => g.name === 'Internal Transfer');
-  if(itGroup && itGroup.places){
-    const oldPlace = itGroup.places.find(p => p.name === 'USD Conversion');
-    if(oldPlace) oldPlace.name = 'BML Staff Dollar Support';
+  // place first called "USD Conversion", then "BML Staff Dollar Support" —
+  // settle on "Staff Usd Exchange". Make sure it exists (with its match
+  // keyword) even if you've never clicked "Convert to USD" yet, and
+  // retroactively tag any existing, currently-untagged "STAFF USD" import
+  // — covers statements imported before this feature/tag ever existed.
+  let itGroup = state.tagGroups.find(g => g.name === 'Internal Transfer');
+  if(!itGroup){
+    itGroup = { id: uid('tg'), name:'Internal Transfer', savings:false, excludeFromSpending:true, places:[], purposes:[] };
+    state.tagGroups.push(itGroup);
   }
+  itGroup.places = itGroup.places || [];
+  let usdPlace = itGroup.places.find(p => p.name==='USD Conversion' || p.name==='BML Staff Dollar Support' || p.name==='Staff Usd Exchange');
+  if(usdPlace){
+    usdPlace.name = 'Staff Usd Exchange';
+    usdPlace.matches = usdPlace.matches || [];
+    if(!usdPlace.matches.some(m=>m.toUpperCase()==='STAFF USD')) usdPlace.matches.push('STAFF USD');
+  } else {
+    usdPlace = { id: uid('te'), name:'Staff Usd Exchange', matches:['STAFF USD'] };
+    itGroup.places.push(usdPlace);
+  }
+  applyPlaceToMatchingTransactions(itGroup.id, usdPlace.id, null);
 }
 function loadLocal(){
   try{
@@ -303,6 +316,33 @@ function toast(msg, kind){
 /* ---------------- account computations ---------------- */
 function getAccount(id){ return state.accounts.find(a=>a.id===id); }
 function liveTx(acc){ return (acc.transactions||[]).filter(t=>!t.excluded); }
+
+// Learning a match keyword only ever affected FUTURE transactions (new
+// imports, new manual entries) — it never reached back to tag transactions
+// already sitting in an account. This does exactly that: given a place's
+// current match keywords, tag every existing, currently-UNTAGGED transaction
+// whose description matches, across every account. Never overrides a
+// transaction that's already tagged with some other place.
+function applyPlaceToMatchingTransactions(groupId, placeId, purposeId){
+  const g = state.tagGroups.find(x=>x.id===groupId);
+  const place = g && (g.places||[]).find(p=>p.id===placeId);
+  if(!place || !place.matches || !place.matches.length) return 0;
+  let count = 0;
+  for(const acc of state.accounts){
+    for(const tx of liveTx(acc)){
+      if(tx.placeId) continue;
+      const desc = (tx.description || tx.altDescription || '').toUpperCase();
+      if(!desc) continue;
+      if(place.matches.some(m => m && desc.includes(m.toUpperCase()))){
+        tx.tagGroupId = groupId;
+        tx.placeId = placeId;
+        if(purposeId && !tx.purposeId) tx.purposeId = purposeId;
+        count++;
+      }
+    }
+  }
+  return count;
+}
 
 function accountTotal(acc){
   let t = acc.startingBalance || 0;
@@ -1204,6 +1244,11 @@ function findOrCreateInternalTransferEntry(name, matches){
   if(!place){
     place = { id: uid('te'), name, matches: matches.slice() };
     group.places.push(place);
+  } else {
+    // an existing place might predate this keyword — merge it in rather than ignore it
+    for(const m of matches){
+      if(!place.matches.some(existing => existing.toUpperCase()===m.toUpperCase())) place.matches.push(m);
+    }
   }
   return { group, place };
 }
@@ -1242,7 +1287,7 @@ function openUsdConversionModal(accId){
 
     const doRealize = ()=>{
       const transferGroupId = uid('xfer');
-      const { group, place } = findOrCreateInternalTransferEntry('BML Staff Dollar Support', ['STAFF USD']);
+      const { group, place } = findOrCreateInternalTransferEntry('Staff Usd Exchange', ['STAFF USD']);
       a.transactions.push({
         id: uid('tx'), date, code:'Standing Order', uniqueId:null,
         description:'STAFF USD', altDescription:'', descriptionOverride:null,
@@ -1629,18 +1674,23 @@ ACTIONS.applyTagSelection = ()=>{
   const { accId, txId, expandedGroup, pendingPlaceId, pendingPurposeId } = tagModalState;
   const a = getAccount(accId); const tx = a.transactions.find(x=>x.id===txId);
   const rememberCb = document.getElementById('remember-place-cb');
+  let learnedKeyword = false;
   if(pendingPlaceId && rememberCb && rememberCb.checked){
     const g = state.tagGroups.find(x=>x.id===expandedGroup);
     const place = g.places.find(p=>p.id===pendingPlaceId);
     const desc = (tx.description || tx.altDescription || '').trim();
-    if(desc) place.matches.push(desc.toUpperCase());
+    if(desc){ place.matches.push(desc.toUpperCase()); learnedKeyword = true; }
   }
+  // apply the manual choice to THIS transaction first, so the retroactive
+  // sweep below (which skips already-tagged transactions) doesn't double-count it
   if(pendingPlaceId || pendingPurposeId){
     tx.tagGroupId = expandedGroup; tx.placeId = pendingPlaceId; tx.purposeId = pendingPurposeId;
   } else {
     tx.tagGroupId = null; tx.placeId = null; tx.purposeId = null;
   }
+  const extraCount = learnedKeyword ? applyPlaceToMatchingTransactions(expandedGroup, pendingPlaceId, pendingPurposeId) : 0;
   scheduleSave(); closeModal(); render();
+  if(extraCount > 0) toast(`Also tagged ${extraCount} other matching transaction${extraCount>1?'s':''}`, 'success');
 };
 ACTIONS.clearTag = (t)=>{
   const a=getAccount(t.dataset.id); const tx=a.transactions.find(x=>x.id===t.dataset.tx);
@@ -2271,6 +2321,7 @@ function tagSettingsBlockHtml(g){
             <div class="tag-entry-row">
               <input type="text" class="tag-place-name" data-group="${g.id}" data-place="${p.id}" value="${escapeHtml(p.name)}" style="width:130px;flex:none;">
               <input type="text" class="tag-place-matches" data-group="${g.id}" data-place="${p.id}" value="${escapeHtml((p.matches||[]).join(', '))}" placeholder="match keywords, comma-separated" style="flex:1;">
+              ${(p.matches||[]).length ? `<button type="button" class="btn sm ghost" data-action="applyPlaceRetroactively" data-group="${g.id}" data-place="${p.id}" title="Tag any existing transactions that already match">Apply</button>` : ''}
               <span class="x-close" data-action="deleteTagPlace" data-group="${g.id}" data-place="${p.id}">✕</span>
             </div>`).join('') || '<div class="faint" style="font-size:11.5px;margin-bottom:6px;">No places yet.</div>'}
           <div class="row" style="margin-top:6px;">
@@ -2462,6 +2513,11 @@ ACTIONS.deleteTagPlace = (t)=>{
     state.accounts.forEach(a=>a.transactions.forEach(tx=>{ if(tx.placeId===t.dataset.place) tx.placeId=null; }));
     scheduleSave(); render();
   }, 'Delete', true);
+};
+ACTIONS.applyPlaceRetroactively = (t)=>{
+  const count = applyPlaceToMatchingTransactions(t.dataset.group, t.dataset.place, null);
+  scheduleSave(); render();
+  toast(count>0 ? `Tagged ${count} matching transaction${count>1?'s':''}` : 'No untagged transactions matched', count>0?'success':'error');
 };
 ACTIONS.addTagPurpose = (t)=>{
   const wrap = t.closest('.tag-group-block');
