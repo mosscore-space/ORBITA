@@ -1078,6 +1078,7 @@ function transactionRowHtml(a, tx){
       <td style="min-width:180px;">
         <input class="desc-edit" value="${escapeHtml(txDisplayDescription(tx))}" data-id="${a.id}" data-tx="${tx.id}">
         ${!tx.matched?'<span class="badge amber" style="margin-top:4px;">unmatched</span>':''}
+        ${tx.notes?`<div class="faint" style="font-size:10.5px;margin-top:3px;cursor:pointer;" data-action="editNote" data-id="${a.id}" data-tx="${tx.id}" title="${escapeHtml(tx.notes)}">🗒️ ${escapeHtml(tx.notes.length>44?tx.notes.slice(0,44)+'…':tx.notes)}</div>`:''}
       </td>
       <td><span class="badge">${escapeHtml(tx.code||'—')}</span></td>
       <td>
@@ -1097,6 +1098,7 @@ function transactionRowHtml(a, tx){
       </td>
       <td>
         ${!tx.matched?`<span class="x-close" data-action="editTx" data-id="${a.id}" data-tx="${tx.id}" title="Edit" style="margin-right:6px;">✎</span>`:''}
+        <span class="x-close" data-action="editNote" data-id="${a.id}" data-tx="${tx.id}" title="${tx.notes?'Edit note':'Add note'}" style="margin-right:6px;">🗒️</span>
         <span class="x-close" data-action="deleteTx" data-id="${a.id}" data-tx="${tx.id}" title="Remove">✕</span>
       </td>
     </tr>
@@ -1428,11 +1430,12 @@ function openNewTxModal(accId){
           <input type="hidden" name="dir" value="debit">
         </div>
       </div>
-      <div class="field"><label>Note (optional)</label><input type="text" name="description" placeholder="What was this for? e.g. lunch with the team"></div>
+      <div class="field"><label>Description (optional)</label><input type="text" name="description" placeholder="e.g. Nisal Mart"></div>
       <div class="row">
         <div class="field"><label>Amount (${a.currency})</label><input type="number" step="0.01" name="amount" required></div>
         <div class="field"><label>Category code (optional)</label><input type="text" name="code" placeholder="e.g. Purchase"></div>
       </div>
+      <div class="field"><label>Notes (optional)</label><textarea name="notes" placeholder="Any extra details you want to remember — e.g. paid cash, will reimburse later"></textarea></div>
       <div class="field"><label>Envelope (optional)</label>
         <select name="envelopeId"><option value="">—</option>${(a.envelopes||[]).map(e=>`<option value="${e.id}">${escapeHtml(e.name)}</option>`).join('')}</select>
       </div>
@@ -1455,11 +1458,12 @@ function openNewTxModal(accId){
     const amount = parseAmount(f.get('amount'));
     const date = f.get('date');
     const desc = f.get('description').trim();
+    const notes = f.get('notes').trim();
     const doAdd = ()=>{
       const auto = autoTagForDescription(desc);
       const tx = {
         id: uid('tx'), date, code: f.get('code').trim()||'Manual',
-        uniqueId:null, description: desc, altDescription:'', descriptionOverride:null,
+        uniqueId:null, description: desc, altDescription:'', descriptionOverride:null, notes: notes||null,
         debit: dir==='debit'?amount:0, credit: dir==='credit'?amount:0,
         balance:null, tagGroupId: auto?auto.tagGroupId:null, placeId: auto?auto.placeId:null, purposeId: null,
         envelopeId: f.get('envelopeId')||null, source:'manual', matched:false,
@@ -1499,11 +1503,12 @@ function openEditTxModal(accId, txId){
           <input type="hidden" name="dir" value="${isCredit?'credit':'debit'}">
         </div>
       </div>
-      <div class="field"><label>Note (optional)</label><input type="text" name="description" value="${escapeHtml(tx.descriptionOverride || tx.description || '')}" placeholder="What was this for?"></div>
+      <div class="field"><label>Description (optional)</label><input type="text" name="description" value="${escapeHtml(tx.descriptionOverride || tx.description || '')}" placeholder="e.g. Nisal Mart"></div>
       <div class="row">
         <div class="field"><label>Amount (${a.currency})</label><input type="number" step="0.01" name="amount" value="${isCredit?tx.credit:tx.debit}" required></div>
         <div class="field"><label>Category code (optional)</label><input type="text" name="code" value="${escapeHtml(tx.code||'')}" placeholder="e.g. Purchase"></div>
       </div>
+      <div class="field"><label>Notes (optional)</label><textarea name="notes" placeholder="Any extra details you want to remember">${escapeHtml(tx.notes||'')}</textarea></div>
       <div class="hint" style="margin-bottom:12px;">Only unmatched, manually-entered transactions can be edited this way — once one matches your real statement, its details are locked in.</div>
       <div class="modal-actions">
         <button type="button" class="btn ghost" data-action="closeModal">Cancel</button>
@@ -1524,6 +1529,7 @@ function openEditTxModal(accId, txId){
     const amount = parseAmount(f.get('amount'));
     const date = f.get('date');
     const desc = f.get('description').trim();
+    const notes = f.get('notes').trim();
     const code = f.get('code').trim() || 'Manual';
     const doSave = ()=>{
       const directionChanged = (dir==='credit') !== (tx.credit>0);
@@ -1532,6 +1538,7 @@ function openEditTxModal(accId, txId){
       tx.credit = dir==='credit' ? amount : 0;
       tx.description = desc;
       tx.descriptionOverride = null;
+      tx.notes = notes || null;
       tx.code = code;
       if(dir==='debit'){
         tx.isIncome = false;
@@ -1549,6 +1556,35 @@ function openEditTxModal(accId, txId){
   };
 }
 ACTIONS.editTx = (t)=> openEditTxModal(t.dataset.id, t.dataset.tx);
+
+/* ---------------- notes — a purely personal annotation, separate from the
+   transaction's own description. Unlike date/amount/description, this
+   doesn't reflect anything about the real bank record, so it stays editable
+   on every transaction regardless of matched status — it's just a reminder
+   to yourself. ---------------- */
+function openNoteModal(accId, txId){
+  const a = getAccount(accId);
+  const tx = a.transactions.find(x=>x.id===txId);
+  openModal(`
+    <div class="modal-head"><div class="modal-title">Note</div><span class="x-close" data-action="closeModal">✕</span></div>
+    <div class="faint" style="font-size:12px;margin-bottom:12px;">${escapeHtml(txDisplayDescription(tx))} · ${fmtDate(tx.date)}</div>
+    <form id="note-form">
+      <div class="field"><label>Notes (optional)</label><textarea name="notes" placeholder="Any extra details you want to remember">${escapeHtml(tx.notes||'')}</textarea></div>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" data-action="closeModal">Cancel</button>
+        <button type="submit" class="btn primary">Save note</button>
+      </div>
+    </form>
+  `);
+  document.getElementById('note-form').onsubmit = (e)=>{
+    e.preventDefault();
+    const f = new FormData(e.target);
+    tx.notes = f.get('notes').trim() || null;
+    scheduleSave(); closeModal(); render();
+    toast(tx.notes ? 'Note saved' : 'Note cleared', 'success');
+  };
+}
+ACTIONS.editNote = (t)=> openNoteModal(t.dataset.id, t.dataset.tx);
 
 /* ---------------- tagging: independent Place + Purpose selection ---------------- */
 var tagModalState = { accId:null, txId:null, expandedGroup:null, placeSearch:'', purposeSearch:'', pendingPlaceId:null, pendingPurposeId:null, remember:true };
