@@ -344,6 +344,48 @@ function applyPlaceToMatchingTransactions(groupId, placeId, purposeId){
   return count;
 }
 
+// Detects likely transfers between YOUR OWN accounts that happened through
+// the real bank (not through Orbita's own "Transfer funds" tool) — they
+// import as two separate, seemingly-unrelated rows (a debit in one account,
+// a credit in another) with no way to know they're the same movement. The
+// signal that's actually reliable across banks is: same amount, opposite
+// direction, close dates, different accounts, same currency. A matching
+// description (e.g. your own name on both sides) is a nice extra clue but
+// not required, since wording varies. Never auto-applies anything — these
+// are candidates for you to confirm or dismiss.
+function detectTransferCandidates(){
+  const candidates = [];
+  const seen = new Set();
+  const eligible = (tx) => !tx.transferGroupId && !tx.transferDismissed && !isExcludedFromSpending(tx) && (tx.debit>0 || tx.credit>0);
+  for(const accA of state.accounts){
+    for(const txA of liveTx(accA)){
+      if(!eligible(txA)) continue;
+      const isDebitA = txA.debit > 0;
+      const amtA = isDebitA ? txA.debit : txA.credit;
+      for(const accB of state.accounts){
+        if(accB.id === accA.id || accB.currency !== accA.currency) continue;
+        for(const txB of liveTx(accB)){
+          if(!eligible(txB)) continue;
+          const isDebitB = txB.debit > 0;
+          if(isDebitA === isDebitB) continue; // need opposite directions to be a transfer
+          const amtB = isDebitB ? txB.debit : txB.credit;
+          if(Math.abs(amtA - amtB) > 0.01) continue;
+          if(daysBetween(txA.date, txB.date) > 3) continue;
+          const pairKey = [txA.id, txB.id].sort().join('|');
+          if(seen.has(pairKey)) continue;
+          seen.add(pairKey);
+          candidates.push({ txA, accA, txB, accB, amount: amtA });
+        }
+      }
+    }
+  }
+  return candidates;
+}
+function findTxInAccount(accId, txId){
+  const acc = getAccount(accId);
+  return acc ? acc.transactions.find(t=>t.id===txId) : null;
+}
+
 function accountTotal(acc){
   let t = acc.startingBalance || 0;
   for(const tx of liveTx(acc)){ t += (tx.credit||0) - (tx.debit||0); }
@@ -604,6 +646,7 @@ function renderDashboard(){
   const maxPurpose = Math.max(1, ...topPurposes.map(p=>p[1]));
 
   const unmatched = collectUnmatched();
+  const transferCandidateCount = detectTransferCandidates().length;
 
   const monthNav = `
     <button class="btn icon ghost" data-action="dashPrevMonth" title="Previous month">‹</button>
@@ -615,6 +658,10 @@ function renderDashboard(){
     ${unmatched.length ? `<div class="banner">
       ⚠️ ${unmatched.length} transaction${unmatched.length>1?'s':''} need reconciling against your statement.
       <button class="btn sm" data-action="showUnmatched">Review</button>
+    </div>` : ''}
+    ${transferCandidateCount>0 ? `<div class="banner">
+      🔀 ${transferCandidateCount} possible internal transfer${transferCandidateCount>1?'s':''} between your accounts, waiting for you to confirm.
+      <button class="btn sm" data-action="goToSettings">Review</button>
     </div>` : ''}
 
     <div class="grid grid-5" style="margin-bottom:18px;">
@@ -766,6 +813,7 @@ ACTIONS.dashNextMonth = ()=>{ if(dashboardMonth<maxDashboardMonth()){ dashboardM
 // month's dashboard needs to be viewable before the calendar actually turns over.
 function maxDashboardMonth(){ return monthDelta(currentMonthKey(), 1); }
 ACTIONS.showUnmatched = showUnmatchedModal;
+ACTIONS.goToSettings = ()=> go('settings');
 /* =========================================================
    Part 4: Accounts — list view + create/edit modals
    ========================================================= */
@@ -2315,6 +2363,7 @@ function renderSettings(){
 
     ${githubSettingsCardHtml()}
     ${dataCheckCardHtml()}
+    ${transferCandidatesCardHtml()}
 
     <div class="card" style="margin-bottom:16px;">
       <div class="section-head">
@@ -2657,6 +2706,57 @@ ACTIONS.repairLiabilityPayment = (t)=>{
   iss.payment.txId = tx.id;
   scheduleSave(); render();
   toast(`Fixed — ${fmtMoney(iss.payment.amount)} now debited from ${acc.name}`, 'success');
+};
+
+/* =========================================================
+   Possible internal transfers — pairs across your own accounts
+   that look like the same real-bank transfer (same amount, opposite
+   direction, close dates), surfaced for you to confirm or dismiss.
+   Never auto-applied.
+   ========================================================= */
+function transferCandidatesCardHtml(){
+  const candidates = detectTransferCandidates();
+  if(!candidates.length) return `
+    <div class="card" style="margin-bottom:16px;">
+      <div class="section-title" style="margin-bottom:8px;">Possible internal transfers</div>
+      <div class="hint" style="margin:0;">No unreviewed matches right now. When you move money between your own accounts through your real bank, both sides usually import as ordinary-looking rows — matching pairs (same amount, opposite direction, close dates, different accounts) will show up here to confirm.</div>
+    </div>
+  `;
+  return `
+    <div class="card" style="margin-bottom:16px;">
+      <div class="section-title" style="margin-bottom:8px;">Possible internal transfers</div>
+      <div class="hint" style="margin-bottom:12px;">Found ${candidates.length} pair${candidates.length>1?'s':''} that look like transfers between your own accounts. Confirming tags both sides as an internal transfer — not spending, not income — the same as using "Transfer funds" directly.</div>
+      ${candidates.map(c=>`
+        <div class="settings-item" style="margin-bottom:8px;">
+          <div>
+            <div style="font-size:13px;">${fmtDate(c.txA.date)} — ${fmtMoney(c.amount)} MVR · ${escapeHtml(c.accA.name)} (${c.txA.debit>0?'−debit':'+credit'}) ↔ ${escapeHtml(c.accB.name)} (${c.txB.debit>0?'−debit':'+credit'})</div>
+            <div class="faint" style="font-size:11px;">"${escapeHtml(txDisplayDescription(c.txA))}" / "${escapeHtml(txDisplayDescription(c.txB))}"</div>
+          </div>
+          <div style="display:flex;gap:6px;flex:none;">
+            <button class="btn ghost sm" data-action="dismissTransferCandidate" data-acca="${c.accA.id}" data-txa="${c.txA.id}" data-accb="${c.accB.id}" data-txb="${c.txB.id}">Not a transfer</button>
+            <button class="btn primary sm" data-action="confirmTransferCandidate" data-acca="${c.accA.id}" data-txa="${c.txA.id}" data-accb="${c.accB.id}" data-txb="${c.txB.id}">Confirm transfer</button>
+          </div>
+        </div>`).join('')}
+    </div>
+  `;
+}
+ACTIONS.confirmTransferCandidate = (t)=>{
+  const txA = findTxInAccount(t.dataset.acca, t.dataset.txa);
+  const txB = findTxInAccount(t.dataset.accb, t.dataset.txb);
+  if(!txA || !txB) return;
+  const { group, place } = findOrCreateInternalTransferEntry('Account Transfer', []);
+  const transferGroupId = uid('xfer');
+  txA.tagGroupId = group.id; txA.placeId = place.id; txA.purposeId = null; txA.isIncome = false; txA.transferGroupId = transferGroupId;
+  txB.tagGroupId = group.id; txB.placeId = place.id; txB.purposeId = null; txB.isIncome = false; txB.transferGroupId = transferGroupId;
+  scheduleSave(); render();
+  toast('Marked as an internal transfer on both sides', 'success');
+};
+ACTIONS.dismissTransferCandidate = (t)=>{
+  const txA = findTxInAccount(t.dataset.acca, t.dataset.txa);
+  const txB = findTxInAccount(t.dataset.accb, t.dataset.txb);
+  if(txA) txA.transferDismissed = true;
+  if(txB) txB.transferDismissed = true;
+  scheduleSave(); render();
 };
 /* =========================================================
    Part 11: Win98 window chrome
