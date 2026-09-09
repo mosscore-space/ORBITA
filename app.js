@@ -2159,7 +2159,7 @@ function computeYearFlow(year){
         const mvr = convertToMVR(tx.debit, acc.currency) || 0;
         const g = tx.tagGroupId ? state.tagGroups.find(x=>x.id===tx.tagGroupId) : null;
         const key = g ? g.id : '__untagged__';
-        if(!cats[key]) cats[key] = { name: g?g.name:'Untagged', savings: g?!!g.savings:false, amount:0 };
+        if(!cats[key]) cats[key] = { groupId: g?g.id:null, name: g?g.name:'Untagged', savings: g?!!g.savings:false, amount:0 };
         cats[key].amount += mvr;
       }
     }
@@ -2252,9 +2252,19 @@ function sankeySvg(income, categories, leftover){
       L ${rightX} ${y1} C ${midX} ${y1}, ${midX} ${srcY1}, ${leftX+nodeW} ${srcY1} Z"
       fill="${color}" opacity="0.4" stroke="${color}" stroke-width="0.5"/>`);
 
-    nodeRects.push(`<rect x="${rightX}" y="${y0}" width="${nodeW}" height="${n.h}" fill="${color}" stroke="#000" stroke-width="1"/>`);
+    // clicking any node (the block or its label) drills into what makes up that
+    // amount — purposes within a category, or the transactions behind Left
+    // over / Other / Untagged. All wrapped in one <g> so either the colored
+    // block or the text label triggers it.
+    const clickAttrs = n.leftover ? `data-action="drillFlowLeftover"`
+      : n.other ? `data-action="drillFlowOther"`
+      : n.groupId ? `data-action="drillFlowCategory" data-group="${n.groupId}" data-name="${escapeHtml(n.name)}"`
+      : `data-action="drillFlowUntagged"`;
+    nodeRects.push(`<g ${clickAttrs} style="cursor:pointer;">
+      <rect x="${rightX}" y="${y0}" width="${nodeW}" height="${n.h}" fill="${color}" stroke="#000" stroke-width="1"/>
+    </g>`);
     // one line per node (name — amount) so short nodes never collide with their neighbor's label
-    labels.push(`<text x="${rightX+nodeW+10}" y="${(y0+y1)/2+4.5}" fill="#000000" font-size="13" font-family="Tahoma"><tspan font-weight="700">${escapeHtml(n.name)}</tspan><tspan fill="#3a3a3a" font-family="Consolas" font-size="11.5"> — ${fmtMoney(n.amount)}</tspan></text>`);
+    labels.push(`<text ${clickAttrs} style="cursor:pointer;" x="${rightX+nodeW+10}" y="${(y0+y1)/2+4.5}" fill="#000000" font-size="13" font-family="Tahoma"><tspan font-weight="700">${escapeHtml(n.name)}</tspan><tspan fill="#3a3a3a" font-family="Consolas" font-size="11.5"> — ${fmtMoney(n.amount)}</tspan></text>`);
     cursorY += n.h + gap;
   }
 
@@ -2307,6 +2317,138 @@ AFTER_RENDER_HOOKS.flow = function(){
   sizeSankeyToFit();
 };
 window.addEventListener('resize', sizeSankeyToFit);
+
+/* =========================================================
+   Yearly Flow drill-down — click a category (or Left over / Other /
+   Untagged) to see the purposes behind it, click a purpose to see the
+   actual transactions, and edit/tag/note/delete them right from there.
+   ========================================================= */
+function computeGroupBreakdown(groupId, year, byField){
+  const g = state.tagGroups.find(x=>x.id===groupId);
+  const buckets = {};
+  for(const acc of state.accounts){
+    for(const tx of liveTx(acc)){
+      if(tx.tagGroupId !== groupId || !tx.debit) continue;
+      if(Number(attributedMonthKey(tx.date).slice(0,4)) !== year) continue;
+      const mvr = convertToMVR(tx.debit, acc.currency) || 0;
+      const key = tx[byField] || '__none__';
+      if(!buckets[key]){
+        let name = byField==='purposeId' ? 'No purpose set' : 'Unknown place';
+        if(tx[byField] && g){
+          const list = byField==='purposeId' ? g.purposes : g.places;
+          const found = (list||[]).find(x=>x.id===tx[byField]);
+          if(found) name = found.name;
+        }
+        buckets[key] = { key, name, amount:0 };
+      }
+      buckets[key].amount += mvr;
+    }
+  }
+  return Object.values(buckets).sort((a,b)=>b.amount-a.amount);
+}
+function collectGroupTransactions(groupId, year, byField, key){
+  const rows = [];
+  for(const acc of state.accounts){
+    for(const tx of liveTx(acc)){
+      if(tx.tagGroupId !== groupId || !tx.debit) continue;
+      if(Number(attributedMonthKey(tx.date).slice(0,4)) !== year) continue;
+      if((tx[byField] || '__none__') !== key) continue;
+      rows.push({ tx, acc });
+    }
+  }
+  return rows.sort((a,b)=> a.tx.date < b.tx.date ? 1 : -1);
+}
+function collectUntaggedTransactions(year){
+  const rows = [];
+  for(const acc of state.accounts){
+    for(const tx of liveTx(acc)){
+      if(tx.tagGroupId || !tx.debit) continue;
+      if(Number(attributedMonthKey(tx.date).slice(0,4)) !== year) continue;
+      rows.push({ tx, acc });
+    }
+  }
+  return rows.sort((a,b)=> a.tx.date < b.tx.date ? 1 : -1);
+}
+
+function openFlowCategoryModal(groupId, groupName){
+  const breakdown = computeGroupBreakdown(groupId, flowYear, 'purposeId');
+  openModal(`
+    <div class="modal-head"><div class="modal-title">${escapeHtml(groupName)} — ${flowYear}</div><span class="x-close" data-action="closeModal">✕</span></div>
+    <div class="faint" style="font-size:12px;margin-bottom:12px;">What this ${fmtMoney(breakdown.reduce((s,b)=>s+b.amount,0))} actually went to.</div>
+    ${breakdown.length ? breakdown.map(b=>`
+      <div class="settings-item" style="margin-bottom:6px;cursor:pointer;" data-action="drillFlowPurpose" data-group="${groupId}" data-key="${escapeHtml(b.key)}" data-name="${escapeHtml(b.name)}" data-title="${escapeHtml(groupName)}">
+        <div style="font-size:13px;">${escapeHtml(b.name)}</div>
+        <div class="num" style="font-size:13px;">${fmtMoney(b.amount)}</div>
+      </div>`).join('') : `<div class="faint">No transactions found for ${flowYear}.</div>`}
+  `, {wide:true});
+}
+
+function openFlowOtherModal(){
+  const { categories: rawCategories } = computeYearFlow(flowYear);
+  const consolidated = consolidateCategories(rawCategories, 7);
+  const visibleNames = new Set(consolidated.filter(c=>!c.other).map(c=>c.name));
+  const folded = rawCategories.filter(c=>!visibleNames.has(c.name)).sort((a,b)=>b.amount-a.amount);
+  openModal(`
+    <div class="modal-head"><div class="modal-title">Other — ${flowYear}</div><span class="x-close" data-action="closeModal">✕</span></div>
+    <div class="faint" style="font-size:12px;margin-bottom:12px;">Smaller categories folded together on the diagram — click one to see what's in it.</div>
+    ${folded.length ? folded.map(c=>{
+      const attrs = c.groupId ? `data-action="drillFlowCategory" data-group="${c.groupId}" data-name="${escapeHtml(c.name)}"` : `data-action="drillFlowUntagged"`;
+      return `<div class="settings-item" style="margin-bottom:6px;cursor:pointer;" ${attrs}>
+        <div style="font-size:13px;">${escapeHtml(c.name)}</div>
+        <div class="num" style="font-size:13px;">${fmtMoney(c.amount)}</div>
+      </div>`;
+    }).join('') : `<div class="faint">Nothing found.</div>`}
+  `, {wide:true});
+}
+
+function openFlowLeftoverModal(){
+  // Left over = income minus tracked spending. The only CONCRETE transactions
+  // inside it are internal transfers (excluded from the category breakdown
+  // by design) — the rest is genuinely just unspent balance, with no
+  // transaction behind it to show.
+  const itGroup = state.tagGroups.find(g => g.name === 'Internal Transfer');
+  const breakdown = itGroup ? computeGroupBreakdown(itGroup.id, flowYear, 'placeId') : [];
+  openModal(`
+    <div class="modal-head"><div class="modal-title">Left over — ${flowYear}</div><span class="x-close" data-action="closeModal">✕</span></div>
+    <div class="faint" style="font-size:12px;margin-bottom:12px;">${breakdown.length ? 'Internal transfers made up part of this — the rest is simply unspent, still sitting in your accounts.' : 'This is simply unspent — still sitting in your accounts, nothing to drill into.'}</div>
+    ${breakdown.length ? breakdown.map(b=>`
+      <div class="settings-item" style="margin-bottom:6px;cursor:pointer;" data-action="drillFlowPurpose" data-group="${itGroup.id}" data-key="${escapeHtml(b.key)}" data-name="${escapeHtml(b.name)}" data-title="Internal Transfer" data-byfield="placeId">
+        <div style="font-size:13px;">${escapeHtml(b.name)}</div>
+        <div class="num" style="font-size:13px;">${fmtMoney(b.amount)}</div>
+      </div>`).join('') : ''}
+  `, {wide:true});
+}
+
+function openFlowTransactionListModal(title, rows){
+  openModal(`
+    <div class="modal-head"><div class="modal-title">${escapeHtml(title)}</div><span class="x-close" data-action="closeModal">✕</span></div>
+    ${rows.length ? `<div class="table-wrap"><table>
+      <thead><tr><th>Date</th><th>Description</th><th>Account</th><th>Amount</th><th></th></tr></thead>
+      <tbody>${rows.map(({tx,acc})=>`
+        <tr>
+          <td class="num" style="white-space:nowrap;color:var(--text-dim);">${fmtDate(tx.date)}</td>
+          <td>${escapeHtml(txDisplayDescription(tx))}${tx.notes?`<div class="faint" style="font-size:10.5px;margin-top:2px;" title="${escapeHtml(tx.notes)}">🗒️ ${escapeHtml(tx.notes.length>36?tx.notes.slice(0,36)+'…':tx.notes)}</div>`:''}</td>
+          <td class="faint" style="font-size:12px;">${escapeHtml(acc.name)}</td>
+          <td class="amt debit">−${fmtMoney(tx.debit)}</td>
+          <td style="white-space:nowrap;">
+            ${!tx.matched?`<span class="x-close" data-action="editTx" data-id="${acc.id}" data-tx="${tx.id}" title="Edit" style="margin-right:6px;">✎</span>`:''}
+            <span class="x-close" data-action="editNote" data-id="${acc.id}" data-tx="${tx.id}" title="${tx.notes?'Edit note':'Add note'}" style="margin-right:6px;">🗒️</span>
+            <span class="x-close" data-action="tagTx" data-id="${acc.id}" data-tx="${tx.id}" title="Tag">🏷️</span>
+          </td>
+        </tr>`).join('')}</tbody>
+    </table></div>` : `<div class="faint">No transactions found.</div>`}
+  `, {wide:true});
+}
+
+ACTIONS.drillFlowCategory = (t)=> openFlowCategoryModal(t.dataset.group, t.dataset.name);
+ACTIONS.drillFlowOther = ()=> openFlowOtherModal();
+ACTIONS.drillFlowLeftover = ()=> openFlowLeftoverModal();
+ACTIONS.drillFlowUntagged = ()=> openFlowTransactionListModal(`Untagged — ${flowYear}`, collectUntaggedTransactions(flowYear));
+ACTIONS.drillFlowPurpose = (t)=>{
+  const byField = t.dataset.byfield || 'purposeId';
+  const rows = collectGroupTransactions(t.dataset.group, flowYear, byField, t.dataset.key);
+  openFlowTransactionListModal(`${t.dataset.title} — ${t.dataset.name}`, rows);
+};
 /* =========================================================
    Part 10: Settings
    ========================================================= */
