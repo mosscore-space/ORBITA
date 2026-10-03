@@ -2148,6 +2148,7 @@ function renderLiabilityDetail(id){
         </div>
         <div style="display:flex;gap:8px;">
           ${!l.closed?`<button class="btn primary sm" data-action="logPayment" data-id="${l.id}">+ Log payment</button>`:''}
+          ${!l.closed?`<button class="btn ghost sm" data-action="openAddLoan" data-id="${l.id}">+ Add loan amount</button>`:''}
           ${!l.closed?`<button class="btn ghost sm" data-action="editLiability" data-id="${l.id}">Edit</button>`:''}
           ${!l.closed?`<button class="btn ghost sm" data-action="closeLiabilityConfirm" data-id="${l.id}">Close out</button>`:''}
         </div>
@@ -2155,7 +2156,11 @@ function renderLiabilityDetail(id){
       <div style="display:flex;gap:32px;flex-wrap:wrap;margin-top:18px;">
         <div><div class="stat-label">Remaining</div><div class="acct-balance" style="${remaining>0?'color:var(--red);':''}">${remaining>0?'−':''}${fmtMoney(remaining)}</div></div>
         <div><div class="stat-label">Paid so far</div><div class="acct-balance" style="font-size:17px;color:var(--text-dim);">${fmtMoney(l.totalPaid)}</div></div>
-        <div><div class="stat-label">Original amount</div><div class="acct-balance" style="font-size:17px;color:var(--text-dim);">${fmtMoney(l.principal)}</div></div>
+        <div><div class="stat-label">Original amount</div>${
+          (l.loanAdditions && l.loanAdditions.length>1)
+            ? `<div class="acct-balance" style="font-size:17px;color:var(--text-dim);cursor:pointer;border-bottom:1px dotted var(--text-dim);display:inline-block;" data-action="showLoanBreakdown" data-id="${l.id}" title="Click to see the separate amounts">${fmtMoney(l.principal)}</div>`
+            : `<div class="acct-balance" style="font-size:17px;color:var(--text-dim);">${fmtMoney(l.principal)}</div>`
+        }</div>
         ${l.closed?`<div><div class="stat-label">Interest paid</div><div class="acct-balance" style="font-size:17px;color:var(--amber);">${fmtMoney(l.interestPaid)}</div></div>`:''}
       </div>
       <div class="progress" style="margin-top:16px;"><div style="width:${pct}%"></div></div>
@@ -2242,6 +2247,53 @@ function closeLiability(id){
   scheduleSave(); render();
   toast('Liability closed out — nicely done','success');
 }
+
+// Borrowing more from the same person/lender later doesn't replace the
+// original loan — it stacks on top of it. This adds to both the total
+// "original amount" and what's still owed, while keeping each separate
+// amount on record (no dates needed — just the figures) so "Original
+// amount" can be broken back down into what was actually lent, and when.
+function openAddLoanModal(liabId){
+  const l = state.liabilities.find(x=>x.id===liabId);
+  openModal(`
+    <div class="modal-head"><div class="modal-title">Add loan amount</div><span class="x-close" data-action="closeModal">✕</span></div>
+    <form id="add-loan-form">
+      <div class="field"><label>How much did you take this time?</label><input type="number" step="0.01" name="amount" required></div>
+      <div class="hint" style="margin-bottom:12px;">Adds to both the total original amount and what's still owed. This doesn't touch any transaction or account — it's just the loan's own figures.</div>
+      <div class="modal-actions">
+        <button type="button" class="btn ghost" data-action="closeModal">Cancel</button>
+        <button type="submit" class="btn primary">Add to loan</button>
+      </div>
+    </form>
+  `);
+  document.getElementById('add-loan-form').onsubmit = (e)=>{
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const amount = parseAmount(f.get('amount'));
+    if(amount<=0) return;
+    if(!l.loanAdditions || !l.loanAdditions.length){
+      l.loanAdditions = [{ id: uid('loanadd'), amount: l.principal }]; // seed with the original amount first
+    }
+    l.loanAdditions.push({ id: uid('loanadd'), amount });
+    l.principal += amount;
+    scheduleSave(); closeModal(); render();
+    toast(`Added ${fmtMoney(amount)} — now owed ${fmtMoney(Math.max(0, l.principal-l.totalPaid))}`, 'success');
+  };
+}
+function openLoanBreakdownModal(liabId){
+  const l = state.liabilities.find(x=>x.id===liabId);
+  const items = (l.loanAdditions && l.loanAdditions.length) ? l.loanAdditions : [{ id:'only', amount: l.principal }];
+  const total = items.reduce((s,it)=>s+it.amount,0);
+  openModal(`
+    <div class="modal-head"><div class="modal-title">${escapeHtml(l.name)} — separate loans</div><span class="x-close" data-action="closeModal">✕</span></div>
+    <div class="table-wrap"><table>
+      <tbody>${items.map((it,i)=>`<tr><td>${i===0?'Original':'Addition '+i}</td><td class="amt debit">${fmtMoney(it.amount)}</td></tr>`).join('')}</tbody>
+      <tfoot><tr><td style="font-weight:700;">Total</td><td class="amt debit" style="font-weight:700;">${fmtMoney(total)}</td></tr></tfoot>
+    </table></div>
+  `);
+}
+ACTIONS.openAddLoan = (t)=> openAddLoanModal(t.dataset.id);
+ACTIONS.showLoanBreakdown = (t)=> openLoanBreakdownModal(t.dataset.id);
 
 function openEditLiabilityModal(id){
   const l = state.liabilities.find(x=>x.id===id);
