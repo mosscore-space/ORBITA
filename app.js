@@ -388,35 +388,62 @@ function findTxInAccount(accId, txId){
 
 // Some liability repayments are deducted automatically by the bank itself —
 // never logged through "Log payment" — so they import as ordinary, unlinked
-// transactions, usually described only by the destination account number
-// (e.g. "To: 7770000252078"). Given a liability's own account number, this
-// finds every matching, not-yet-linked transaction and links it directly —
-// never creates a new transaction, only attaches a payment record to one
-// that's already there, so nothing is ever double-counted. Safe to re-run
-// any time: it always skips a transaction already linked to ANY liability
+// transactions. Two independent, optional signals can identify them: the
+// destination account number appearing in the description (e.g.
+// "To: 7770000252078"), or the transaction's own type/code matching exactly
+// (e.g. "Credit Card Payment"). Either one matching is enough. This finds
+// every matching, not-yet-linked transaction and links it directly — never
+// creates a new transaction, only attaches a payment record to one that's
+// already there, so nothing is ever double-counted. Safe to re-run any
+// time: it always skips a transaction already linked to ANY liability
 // (whether by this sweep or by "Log payment" merging with a real import).
 function linkLiabilityPaymentsByAccountNumber(){
   let count = 0;
   const linkedElsewhere = new Set();
   for(const l of state.liabilities) for(const p of (l.payments||[])) if(p.txId) linkedElsewhere.add(p.txId);
   for(const l of state.liabilities){
-    if(!l.accountNumber || !l.accountNumber.trim()) continue;
-    const needle = l.accountNumber.trim().toUpperCase();
+    const needle = (l.accountNumber||'').trim().toUpperCase();
+    const codeNeedle = (l.matchCode||'').trim().toUpperCase();
+    if(!needle && !codeNeedle) continue;
     for(const acc of state.accounts){
       for(const tx of liveTx(acc)){
         if(!tx.debit || linkedElsewhere.has(tx.id)) continue;
         const desc = (tx.description || tx.altDescription || '').toUpperCase();
-        if(!desc.includes(needle)) continue;
+        const code = (tx.code || '').trim().toUpperCase();
+        const matchesAccountNumber = needle && desc.includes(needle);
+        const matchesCode = codeNeedle && code === codeNeedle;
+        if(!matchesAccountNumber && !matchesCode) continue;
         l.payments = l.payments || [];
         l.payments.push({ id: uid('pay'), date: tx.date, amount: tx.debit, accountId: acc.id, txId: tx.id, autoLinked: true });
         l.totalPaid = (l.totalPaid||0) + tx.debit;
-        if(l.totalPaid > l.principal) l.interestPaid = l.totalPaid - l.principal;
+        if(!l.trackingMode && l.totalPaid > l.principal) l.interestPaid = l.totalPaid - l.principal;
         linkedElsewhere.add(tx.id);
         count++;
       }
     }
   }
   return count;
+}
+
+// A "tracking" liability (e.g. a credit card) isn't paid down to zero — it's
+// an ongoing yearly ledger of what went to it. These views work directly off
+// the same l.payments array every other liability already uses.
+function liabilityYearsWithPayments(l){
+  const years = new Set();
+  for(const p of (l.payments||[])) years.add(Number(p.date.slice(0,4)));
+  years.add(new Date().getFullYear());
+  return [...years].sort((a,b)=>b-a);
+}
+function liabilityPaymentsByMonthForYear(l, year){
+  const months = {};
+  for(const p of (l.payments||[])){
+    if(Number(p.date.slice(0,4)) !== year) continue;
+    const mk = p.date.slice(5,7);
+    if(!months[mk]) months[mk] = { monthKey:mk, amount:0, payments:[] };
+    months[mk].amount += p.amount;
+    months[mk].payments.push(p);
+  }
+  return Object.keys(months).sort().map(mk=>months[mk]);
 }
 
 function accountTotal(acc){
@@ -1966,8 +1993,21 @@ function renderLiabilitiesList(){
 }
 
 function liabilityCardHtml(l){
-  const pct = l.principal>0 ? Math.min(100, (l.totalPaid/l.principal)*100) : 0;
   const acc = getAccount(l.repaymentAccountId);
+  if(l.trackingMode){
+    const thisYear = new Date().getFullYear();
+    const yearTotal = (l.payments||[]).filter(p=>Number(p.date.slice(0,4))===thisYear).reduce((s,p)=>s+p.amount,0);
+    const allTimeTotal = (l.payments||[]).reduce((s,p)=>s+p.amount,0);
+    return `
+      <div class="card liab-card" data-action="openLiability" data-id="${l.id}" style="cursor:pointer;">
+        <div class="acct-name">${escapeHtml(l.name)}</div>
+        <div class="acct-meta">${acc?escapeHtml(acc.name):'no account set'} · tracking yearly totals</div>
+        <div class="acct-balance" style="font-size:20px;margin-top:12px;">${fmtMoney(yearTotal)}<span style="font-size:12px;color:var(--text-dim);"> paid in ${thisYear}</span></div>
+        <div class="liab-row"><span>${fmtMoney(allTimeTotal)} all-time</span><span>${(l.payments||[]).length} payment${(l.payments||[]).length!==1?'s':''}</span></div>
+      </div>
+    `;
+  }
+  const pct = l.principal>0 ? Math.min(100, (l.totalPaid/l.principal)*100) : 0;
   const remaining = Math.max(0, l.principal - l.totalPaid);
   return `
     <div class="card liab-card ${l.closed?'faint':''}" data-action="openLiability" data-id="${l.id}" style="cursor:pointer;">
@@ -1985,16 +2025,20 @@ function openNewLiabilityModal(){
   openModal(`
     <div class="modal-head"><div class="modal-title">New liability</div><span class="x-close" data-action="closeModal">✕</span></div>
     <form id="new-liab-form">
-      <div class="field"><label>Name</label><input type="text" name="name" placeholder="e.g. Car loan / Pay back Ali" required></div>
+      <div class="field"><label>Name</label><input type="text" name="name" placeholder="e.g. Car loan / Pay back Ali / Credit card" required></div>
+      <label class="checkline" style="margin-bottom:12px;"><input type="checkbox" name="trackingMode"> Just track totals paid each year — not paying down a fixed balance</label>
       <div class="row">
-        <div class="field"><label>Total amount owed</label><input type="number" step="0.01" name="principal" required></div>
-        <div class="field"><label>Monthly repayment</label><input type="number" step="0.01" name="monthlyRepayment" required></div>
+        <div class="field"><label>Total amount owed (if applicable)</label><input type="number" step="0.01" name="principal"></div>
+        <div class="field"><label>Typical monthly repayment (if applicable)</label><input type="number" step="0.01" name="monthlyRepayment"></div>
       </div>
       <div class="field"><label>Repayment account</label>
         <select name="repaymentAccountId">${state.accounts.filter(a=>!a.closed).map(a=>`<option value="${a.id}">${escapeHtml(accountLabel(a))}</option>`).join('')}</select>
       </div>
-      <div class="field"><label>Account number (optional)</label><input type="text" name="accountNumber" placeholder="e.g. 7770000252078"></div>
-      <div class="hint" style="margin-bottom:12px;">If the bank deducts this automatically, it'll show up in your statement as a transaction to this account number. Set it here and matching transactions — past and future — link to this liability on their own, without creating a duplicate.</div>
+      <div class="row">
+        <div class="field"><label>Account number (optional)</label><input type="text" name="accountNumber" placeholder="e.g. 7770000252078"></div>
+        <div class="field"><label>Transaction type to auto-match (optional)</label><input type="text" name="matchCode" placeholder="e.g. Credit Card Payment"></div>
+      </div>
+      <div class="hint" style="margin-bottom:12px;">Either of these — a matching account number in the description, or a matching transaction type — links matching transactions automatically, past and future, without creating a duplicate.</div>
       <div class="modal-actions">
         <button type="button" class="btn ghost" data-action="closeModal">Cancel</button>
         <button type="submit" class="btn primary">Add liability</button>
@@ -2005,9 +2049,11 @@ function openNewLiabilityModal(){
     e.preventDefault();
     const f = new FormData(e.target);
     state.liabilities.push({
-      id: uid('liab'), name: f.get('name').trim(), principal: parseAmount(f.get('principal')),
+      id: uid('liab'), name: f.get('name').trim(), trackingMode: !!f.get('trackingMode'),
+      principal: parseAmount(f.get('principal')),
       monthlyRepayment: parseAmount(f.get('monthlyRepayment')), repaymentAccountId: f.get('repaymentAccountId'),
       accountNumber: f.get('accountNumber').trim() || null,
+      matchCode: f.get('matchCode').trim() || null,
       totalPaid:0, interestPaid:0, payments:[], closed:false,
     });
     const linked = linkLiabilityPaymentsByAccountNumber();
@@ -2016,9 +2062,78 @@ function openNewLiabilityModal(){
   };
 }
 
+var liabYearViewState = { liabId: null, year: null };
+function selectedLiabYear(l){
+  const years = liabilityYearsWithPayments(l);
+  if(liabYearViewState.liabId !== l.id || !years.includes(liabYearViewState.year)){
+    liabYearViewState = { liabId: l.id, year: years[0] };
+  }
+  return liabYearViewState.year;
+}
+const LIAB_MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+function renderTrackingLiabilityDetail(l){
+  const acc = getAccount(l.repaymentAccountId);
+  const years = liabilityYearsWithPayments(l);
+  const year = selectedLiabYear(l);
+  const yearTotal = (l.payments||[]).filter(p=>Number(p.date.slice(0,4))===year).reduce((s,p)=>s+p.amount,0);
+  const allTimeTotal = (l.payments||[]).reduce((s,p)=>s+p.amount,0);
+  const byMonth = liabilityPaymentsByMonthForYear(l, year);
+
+  const body = `
+    <div class="card" style="margin-bottom:16px;">
+      <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:14px;">
+        <div>
+          <div class="acct-name" style="font-size:19px;">${escapeHtml(l.name)}</div>
+          <div class="acct-meta">Tracking yearly totals — paid from ${acc?escapeHtml(accountLabel(acc)):'—'}${l.matchCode?` · auto-detects "${escapeHtml(l.matchCode)}" transactions`:''}${l.accountNumber?` · auto-detects transactions to ${escapeHtml(l.accountNumber)}`:''}</div>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button class="btn primary sm" data-action="logPayment" data-id="${l.id}">+ Log payment</button>
+          <button class="btn ghost sm" data-action="editLiability" data-id="${l.id}">Edit</button>
+        </div>
+      </div>
+      <div style="display:flex;gap:32px;flex-wrap:wrap;margin-top:18px;">
+        <div><div class="stat-label">${year} total</div><div class="acct-balance">${fmtMoney(yearTotal)}</div></div>
+        <div><div class="stat-label">All-time total</div><div class="acct-balance" style="font-size:17px;color:var(--text-dim);">${fmtMoney(allTimeTotal)}</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="section-head">
+        <div class="section-title">Payments by month</div>
+        <select id="liab-year-select">${years.map(y=>`<option value="${y}" ${y===year?'selected':''}>${y}</option>`).join('')}</select>
+      </div>
+      ${byMonth.length ? byMonth.map(m=>`
+        <div style="margin-bottom:14px;">
+          <div style="display:flex;justify-content:space-between;font-weight:700;padding:6px 2px;border-bottom:1px solid var(--shadow);">
+            <span>${LIAB_MONTH_NAMES[Number(m.monthKey)-1]}</span><span>${fmtMoney(m.amount)}</span>
+          </div>
+          <div class="table-wrap"><table>
+            <tbody>${m.payments.slice().sort((a,b)=>a.date.localeCompare(b.date)).map(p=>{
+              const pAcc = getAccount(p.accountId);
+              const ptx = pAcc ? pAcc.transactions.find(t=>t.id===p.txId) : null;
+              const reconciled = !!(ptx && ptx.matched);
+              return `<tr>
+                <td style="width:120px;white-space:nowrap;">${fmtDate(p.date)}${p.autoLinked?' <span class="faint" style="font-size:10px;" title="Found automatically, not logged by hand">🔗</span>':''}</td>
+                <td class="amt debit">−${fmtMoney(p.amount)}</td>
+                <td class="faint" style="font-size:12px;">${escapeHtml(pAcc?accountLabel(pAcc):'—')}</td>
+                <td>${reconciled?'<span class="badge green">reconciled</span>':'<span class="badge amber">awaiting statement</span>'}</td>
+              </tr>`;
+            }).join('')}</tbody>
+          </table></div>
+        </div>
+      `).join('') : `<div class="empty"><div class="t">No payments in ${year}</div></div>`}
+    </div>
+  `;
+  return renderPage(
+    `<span data-action="backToLiabilities" style="cursor:pointer;color:var(--text-faint);">Liabilities</span> <span class="faint">/</span> ${escapeHtml(l.name)}`,
+    '', '', body
+  );
+}
+
 function renderLiabilityDetail(id){
   const l = state.liabilities.find(x=>x.id===id);
   if(!l) return renderLiabilitiesList();
+  if(l.trackingMode) return renderTrackingLiabilityDetail(l);
   const acc = getAccount(l.repaymentAccountId);
   const remaining = Math.max(0, l.principal - l.totalPaid);
   const pct = l.principal>0 ? Math.min(100,(l.totalPaid/l.principal)*100) : 0;
@@ -2078,7 +2193,7 @@ function openLogPaymentModal(liabId){
     <form id="log-payment-form">
       <div class="row">
         <div class="field"><label>Date</label><input type="date" name="date" value="${todayIso()}" required></div>
-        <div class="field"><label>Amount</label><input type="number" step="0.01" name="amount" value="${l.monthlyRepayment}" required></div>
+        <div class="field"><label>Amount</label><input type="number" step="0.01" name="amount" value="${l.monthlyRepayment>0?l.monthlyRepayment:''}" required></div>
       </div>
       <div class="field"><label>Paid from</label>
         <select name="accountId">${state.accounts.filter(a=>!a.closed).map(a=>`<option value="${a.id}" ${a.id===l.repaymentAccountId?'selected':''}>${escapeHtml(accountLabel(a))}</option>`).join('')}</select>
@@ -2108,7 +2223,7 @@ function openLogPaymentModal(liabId){
       acc.transactions.push(tx);
       l.payments.push({ id: uid('pay'), date, amount, accountId, txId: tx.id });
       l.totalPaid += amount;
-      if(l.totalPaid > l.principal) l.interestPaid = l.totalPaid - l.principal;
+      if(!l.trackingMode && l.totalPaid > l.principal) l.interestPaid = l.totalPaid - l.principal;
       scheduleSave(); closeModal(); render();
       toast(`Payment logged — ${fmtMoney(amount)} debited from ${acc.name}`, 'success');
     };
@@ -2134,16 +2249,20 @@ function openEditLiabilityModal(id){
     <div class="modal-head"><div class="modal-title">Edit liability</div><span class="x-close" data-action="closeModal">✕</span></div>
     <form id="edit-liab-form">
       <div class="field"><label>Name</label><input type="text" name="name" value="${escapeHtml(l.name)}" required></div>
+      <label class="checkline" style="margin-bottom:12px;"><input type="checkbox" name="trackingMode" ${l.trackingMode?'checked':''}> Just track totals paid each year — not paying down a fixed balance</label>
       <div class="row">
-        <div class="field"><label>Total amount owed</label><input type="number" step="0.01" name="principal" value="${l.principal}" required></div>
-        <div class="field"><label>Monthly repayment</label><input type="number" step="0.01" name="monthlyRepayment" value="${l.monthlyRepayment}" required></div>
+        <div class="field"><label>Total amount owed (if applicable)</label><input type="number" step="0.01" name="principal" value="${l.principal}"></div>
+        <div class="field"><label>Typical monthly repayment (if applicable)</label><input type="number" step="0.01" name="monthlyRepayment" value="${l.monthlyRepayment}"></div>
       </div>
       <div class="field"><label>Repayment account</label>
         <select name="repaymentAccountId">${state.accounts.filter(a=>!a.closed).map(a=>`<option value="${a.id}" ${a.id===l.repaymentAccountId?'selected':''}>${escapeHtml(accountLabel(a))}</option>`).join('')}</select>
         <div class="hint">This only changes where future logged payments go — it doesn't move any payments you've already logged.</div>
       </div>
-      <div class="field"><label>Account number (optional)</label><input type="text" name="accountNumber" value="${escapeHtml(l.accountNumber||'')}" placeholder="e.g. 7770000252078"></div>
-      <div class="hint" style="margin-bottom:12px;">If the bank deducts this automatically, it'll show up in your statement as a transaction to this account number. Set it here and matching transactions — past and future — link to this liability on their own, without creating a duplicate.</div>
+      <div class="row">
+        <div class="field"><label>Account number (optional)</label><input type="text" name="accountNumber" value="${escapeHtml(l.accountNumber||'')}" placeholder="e.g. 7770000252078"></div>
+        <div class="field"><label>Transaction type to auto-match (optional)</label><input type="text" name="matchCode" value="${escapeHtml(l.matchCode||'')}" placeholder="e.g. Credit Card Payment"></div>
+      </div>
+      <div class="hint" style="margin-bottom:12px;">Either of these — a matching account number in the description, or a matching transaction type — links matching transactions automatically, past and future, without creating a duplicate.</div>
       <div class="modal-actions">
         <button type="button" class="btn ghost" data-action="closeModal">Cancel</button>
         <button type="submit" class="btn primary">Save changes</button>
@@ -2154,16 +2273,22 @@ function openEditLiabilityModal(id){
     e.preventDefault();
     const f = new FormData(e.target);
     l.name = f.get('name').trim();
+    l.trackingMode = !!f.get('trackingMode');
     l.principal = parseAmount(f.get('principal'));
     l.monthlyRepayment = parseAmount(f.get('monthlyRepayment'));
     l.repaymentAccountId = f.get('repaymentAccountId');
     l.accountNumber = f.get('accountNumber').trim() || null;
+    l.matchCode = f.get('matchCode').trim() || null;
     const linked = linkLiabilityPaymentsByAccountNumber();
     scheduleSave(); closeModal(); render();
     toast(linked>0 ? `Saved — linked ${linked} existing transaction${linked>1?'s':''} to this liability` : 'Liability updated','success');
   };
 }
 
+AFTER_RENDER_HOOKS.liabilities = function(){
+  const sel = document.getElementById('liab-year-select');
+  if(sel) sel.onchange = ()=>{ liabYearViewState.year = Number(sel.value); render(); };
+};
 ACTIONS.newLiability = openNewLiabilityModal;
 ACTIONS.openLiability = (t)=> go('liabilities',{id:t.dataset.id});
 ACTIONS.backToLiabilities = ()=> go('liabilities');
