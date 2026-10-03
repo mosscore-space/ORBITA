@@ -386,6 +386,39 @@ function findTxInAccount(accId, txId){
   return acc ? acc.transactions.find(t=>t.id===txId) : null;
 }
 
+// Some liability repayments are deducted automatically by the bank itself —
+// never logged through "Log payment" — so they import as ordinary, unlinked
+// transactions, usually described only by the destination account number
+// (e.g. "To: 7770000252078"). Given a liability's own account number, this
+// finds every matching, not-yet-linked transaction and links it directly —
+// never creates a new transaction, only attaches a payment record to one
+// that's already there, so nothing is ever double-counted. Safe to re-run
+// any time: it always skips a transaction already linked to ANY liability
+// (whether by this sweep or by "Log payment" merging with a real import).
+function linkLiabilityPaymentsByAccountNumber(){
+  let count = 0;
+  const linkedElsewhere = new Set();
+  for(const l of state.liabilities) for(const p of (l.payments||[])) if(p.txId) linkedElsewhere.add(p.txId);
+  for(const l of state.liabilities){
+    if(!l.accountNumber || !l.accountNumber.trim()) continue;
+    const needle = l.accountNumber.trim().toUpperCase();
+    for(const acc of state.accounts){
+      for(const tx of liveTx(acc)){
+        if(!tx.debit || linkedElsewhere.has(tx.id)) continue;
+        const desc = (tx.description || tx.altDescription || '').toUpperCase();
+        if(!desc.includes(needle)) continue;
+        l.payments = l.payments || [];
+        l.payments.push({ id: uid('pay'), date: tx.date, amount: tx.debit, accountId: acc.id, txId: tx.id, autoLinked: true });
+        l.totalPaid = (l.totalPaid||0) + tx.debit;
+        if(l.totalPaid > l.principal) l.interestPaid = l.totalPaid - l.principal;
+        linkedElsewhere.add(tx.id);
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
 function accountTotal(acc){
   let t = acc.startingBalance || 0;
   for(const tx of liveTx(acc)){ t += (tx.credit||0) - (tx.debit||0); }
@@ -1901,10 +1934,11 @@ function commitImport(accId, rows){
       envelopeId:null, source:'import', matched:true, isIncome: isIncomeCode(row.code), _seq: Date.now()+Math.random(),
     });
   }
+  const autoLinked = linkLiabilityPaymentsByAccountNumber();
   scheduleSave();
   closeModal();
   render();
-  toast(`Imported ${toAdd.length} new, matched ${toMerge.length}, skipped ${skipped} duplicate${skipped!==1?'s':''}`, 'success');
+  toast(`Imported ${toAdd.length} new, matched ${toMerge.length}, skipped ${skipped} duplicate${skipped!==1?'s':''}${autoLinked>0?` · linked ${autoLinked} to a liability`:''}`, 'success');
 }
 
 ACTIONS.openImport = (t)=> openImportModal(t.dataset.id);
@@ -1959,6 +1993,8 @@ function openNewLiabilityModal(){
       <div class="field"><label>Repayment account</label>
         <select name="repaymentAccountId">${state.accounts.filter(a=>!a.closed).map(a=>`<option value="${a.id}">${escapeHtml(accountLabel(a))}</option>`).join('')}</select>
       </div>
+      <div class="field"><label>Account number (optional)</label><input type="text" name="accountNumber" placeholder="e.g. 7770000252078"></div>
+      <div class="hint" style="margin-bottom:12px;">If the bank deducts this automatically, it'll show up in your statement as a transaction to this account number. Set it here and matching transactions — past and future — link to this liability on their own, without creating a duplicate.</div>
       <div class="modal-actions">
         <button type="button" class="btn ghost" data-action="closeModal">Cancel</button>
         <button type="submit" class="btn primary">Add liability</button>
@@ -1971,10 +2007,12 @@ function openNewLiabilityModal(){
     state.liabilities.push({
       id: uid('liab'), name: f.get('name').trim(), principal: parseAmount(f.get('principal')),
       monthlyRepayment: parseAmount(f.get('monthlyRepayment')), repaymentAccountId: f.get('repaymentAccountId'),
+      accountNumber: f.get('accountNumber').trim() || null,
       totalPaid:0, interestPaid:0, payments:[], closed:false,
     });
+    const linked = linkLiabilityPaymentsByAccountNumber();
     scheduleSave(); closeModal(); render();
-    toast('Liability added','success');
+    toast(linked>0 ? `Liability added — linked ${linked} existing transaction${linked>1?'s':''} already` : 'Liability added','success');
   };
 }
 
@@ -1991,7 +2029,7 @@ function renderLiabilityDetail(id){
       <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:14px;">
         <div>
           <div class="acct-name" style="font-size:19px;">${escapeHtml(l.name)}</div>
-          <div class="acct-meta">Repaid from ${acc?escapeHtml(accountLabel(acc)):'—'} · ${fmtMoney(l.monthlyRepayment)} / month</div>
+          <div class="acct-meta">Repaid from ${acc?escapeHtml(accountLabel(acc)):'—'} · ${fmtMoney(l.monthlyRepayment)} / month${l.accountNumber?` · auto-detects transactions to ${escapeHtml(l.accountNumber)}`:''}</div>
         </div>
         <div style="display:flex;gap:8px;">
           ${!l.closed?`<button class="btn primary sm" data-action="logPayment" data-id="${l.id}">+ Log payment</button>`:''}
@@ -2018,7 +2056,7 @@ function renderLiabilityDetail(id){
           const reconciled = !!(ptx && ptx.matched);
           return `
           <tr>
-            <td>${fmtDate(p.date)}</td>
+            <td>${fmtDate(p.date)}${p.autoLinked?' <span class="faint" style="font-size:10.5px;" title="Found automatically by matching the liability\'s account number — not logged by hand">🔗 auto-detected</span>':''}</td>
             <td class="amt debit">−${fmtMoney(p.amount)}</td>
             <td>${escapeHtml(pAcc?accountLabel(pAcc):'—')}</td>
             <td>${reconciled?'<span class="badge green">reconciled</span>':'<span class="badge amber">awaiting statement</span>'}</td>
@@ -2104,6 +2142,8 @@ function openEditLiabilityModal(id){
         <select name="repaymentAccountId">${state.accounts.filter(a=>!a.closed).map(a=>`<option value="${a.id}" ${a.id===l.repaymentAccountId?'selected':''}>${escapeHtml(accountLabel(a))}</option>`).join('')}</select>
         <div class="hint">This only changes where future logged payments go — it doesn't move any payments you've already logged.</div>
       </div>
+      <div class="field"><label>Account number (optional)</label><input type="text" name="accountNumber" value="${escapeHtml(l.accountNumber||'')}" placeholder="e.g. 7770000252078"></div>
+      <div class="hint" style="margin-bottom:12px;">If the bank deducts this automatically, it'll show up in your statement as a transaction to this account number. Set it here and matching transactions — past and future — link to this liability on their own, without creating a duplicate.</div>
       <div class="modal-actions">
         <button type="button" class="btn ghost" data-action="closeModal">Cancel</button>
         <button type="submit" class="btn primary">Save changes</button>
@@ -2117,8 +2157,10 @@ function openEditLiabilityModal(id){
     l.principal = parseAmount(f.get('principal'));
     l.monthlyRepayment = parseAmount(f.get('monthlyRepayment'));
     l.repaymentAccountId = f.get('repaymentAccountId');
+    l.accountNumber = f.get('accountNumber').trim() || null;
+    const linked = linkLiabilityPaymentsByAccountNumber();
     scheduleSave(); closeModal(); render();
-    toast('Liability updated','success');
+    toast(linked>0 ? `Saved — linked ${linked} existing transaction${linked>1?'s':''} to this liability` : 'Liability updated','success');
   };
 }
 
